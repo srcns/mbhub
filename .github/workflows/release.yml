@@ -1,0 +1,101 @@
+# MBHub — Release pipeline
+#
+# Builds Windows / macOS (ARM+Intel) / Linux binaries for every `v*` tag
+# (or manual trigger), and publishes them to GitHub Releases together with a
+# single consolidated SHA256SUMS.txt covering all four platforms.
+#
+# Usage: git tag v1.0.1 && git push origin v1.0.1
+# Note: Code signing (Authenticode / Developer ID) is a Phase 2 item; the
+# binaries below are unsigned — users must download from the official
+# Releases page and verify the SHA-256 checksums.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: mbhub-linux-x64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: mbhub-windows-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: mbhub-macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: mbhub-macos-x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/mbhub"
+          mkdir -p dist
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            BIN="$BIN.exe"
+            cp "$BIN" dist/mbhub.exe
+            powershell -NoProfile -Command "Compress-Archive -Path dist/mbhub.exe -DestinationPath dist/${{ matrix.artifact }}.zip -Force"
+          else
+            cp "$BIN" dist/mbhub
+            tar -C dist -czf "dist/${{ matrix.artifact }}.tar.gz" mbhub
+          fi
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.*
+
+  release:
+    name: publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Consolidate SHA-256 checksums
+        run: |
+          cd dist
+          sha256sum mbhub-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          ls -la
+
+      - name: Upload everything to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/mbhub-*
+            dist/SHA256SUMS.txt
+          generate_release_notes: true

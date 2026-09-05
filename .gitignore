@@ -1,0 +1,15 @@
+/target
+/.cargo-home
+/mbhub.db
+/mbhub.db-wal
+/mbhub.db-shm
+/mbhub_test.db*
+/mbhub_test.env*
+.env
+.env.*
+*.env
+!.env.example
+
+# Release binaries (uploaded to GitHub Releases, not git tree)
+releases/
+.intentionally-empty-file.o
