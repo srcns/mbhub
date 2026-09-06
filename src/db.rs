@@ -332,6 +332,38 @@ fn init(conn: &Connection) {
         );
     }
 
+    // Author binding: the gossip-authenticated PeerId that distributed this
+    // record ('' for locally authored records). Powers publisher bans.
+    let has_author: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('inferences') WHERE name = 'author_peer_id'",
+            [],
+            |r| {
+                let count: i64 = r.get(0)?;
+                Ok(count > 0)
+            },
+        )
+        .unwrap_or(false);
+
+    if !has_author {
+        let _ = conn.execute(
+            "ALTER TABLE inferences ADD COLUMN author_peer_id TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+    }
+
+    // Publisher bans — LOCAL and PERMANENT by design: banning a publisher
+    // removes all of their records from THIS node's memory and never accepts
+    // them again. Bans never propagate; every user curates their own network.
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS banned_peers (
+            peer_id   TEXT PRIMARY KEY,
+            reason    TEXT NOT NULL DEFAULT '',
+            banned_at INTEGER NOT NULL
+        )",
+        [],
+    );
+
     // Default pointer for blog exports
     let _ = conn.execute(
         "INSERT OR IGNORE INTO meta (key, val) VALUES ('last_blog_export_id', '0')",
@@ -616,7 +648,7 @@ pub fn save_inference(
     provider: &str,
     model: &str,
 ) -> Option<InferenceRecord> {
-    save_inference_internal(question, content, simhash, provider, model, None, false, false)
+    save_inference_internal(question, content, simhash, provider, model, None, false, false, "")
 }
 
 pub fn save_inference_with_truncated(
@@ -627,7 +659,7 @@ pub fn save_inference_with_truncated(
     model: &str,
     is_truncated: bool,
 ) -> Option<InferenceRecord> {
-    save_inference_internal(question, content, simhash, provider, model, None, false, is_truncated)
+    save_inference_internal(question, content, simhash, provider, model, None, false, is_truncated, "")
 }
 
 /// Checks whether a content hash is marked with a tombstone (negative signal).
@@ -709,6 +741,157 @@ fn is_valid_content_hash(hash: &str) -> bool {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// Bans a publisher on THIS node: every record they distributed is deleted
+/// from local memory and their future records are never accepted.
+///
+/// Bans are strictly local (they never propagate) and permanent — removal
+/// is only possible through the explicit unban management UI. Returns the
+/// number of locally deleted records that belonged to the publisher.
+pub fn ban_author(peer_id: &str, reason: &str) -> usize {
+    if peer_id.trim().is_empty() {
+        return 0;
+    }
+    let conn = open();
+    init(&conn);
+    let now = chrono::Local::now().timestamp();
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO banned_peers (peer_id, reason, banned_at) VALUES (?1, ?2, ?3)",
+        params![peer_id, reason, now],
+    );
+    let deleted = conn
+        .execute(
+            "DELETE FROM inferences WHERE author_peer_id = ?1",
+            params![peer_id],
+        )
+        .unwrap_or(0);
+    deleted
+}
+
+/// True when this publisher is locally banned.
+pub fn is_banned(peer_id: &str) -> bool {
+    if peer_id.trim().is_empty() {
+        return false;
+    }
+    let conn = open();
+    init(&conn);
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM banned_peers WHERE peer_id = ?1",
+            params![peer_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    count > 0
+}
+
+/// A locally banned publisher entry (peer id, reason, unix timestamp).
+#[derive(Clone, Debug)]
+pub struct BannedAuthor {
+    pub peer_id: String,
+    pub reason: String,
+    pub banned_at: i64,
+}
+
+/// Lists every locally banned publisher, newest ban first.
+pub fn list_banned() -> Vec<BannedAuthor> {
+    let conn = open();
+    init(&conn);
+    let Ok(mut stmt) =
+        conn.prepare("SELECT peer_id, reason, banned_at FROM banned_peers ORDER BY banned_at DESC")
+    else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([], |r| {
+        Ok(BannedAuthor {
+            peer_id: r.get(0)?,
+            reason: r.get(1)?,
+            banned_at: r.get(2)?,
+        })
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+/// Removes a local publisher ban. Returns true when a ban was removed.
+pub fn unban_author(peer_id: &str) -> bool {
+    let conn = open();
+    init(&conn);
+    conn.execute(
+        "DELETE FROM banned_peers WHERE peer_id = ?1",
+        params![peer_id],
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
+/// Number of locally banned publishers.
+pub fn banned_count() -> usize {
+    let conn = open();
+    init(&conn);
+    conn.query_row("SELECT COUNT(*) FROM banned_peers", [], |r| {
+        r.get(0)
+    })
+    .map(|c: i64| c as usize)
+    .unwrap_or(0)
+}
+
+/// Looks up the gossip-authenticated distributor of a stored record
+/// ('' for locally authored records). Used by the delete flow to offer
+/// publisher-level enforcement.
+pub fn get_author_peer_id(record_id: i64) -> Option<String> {
+    let conn = open();
+    init(&conn);
+    match conn.query_row(
+        "SELECT author_peer_id FROM inferences WHERE id = ?1",
+        params![record_id],
+        |r| r.get::<_, String>(0),
+    ) {
+        Ok(author) if !author.is_empty() => Some(author),
+        _ => None,
+    }
+}
+
+/// Looks up a record's distributor by its content hash ('' = local/unknown).
+pub fn get_author_peer_id_by_hash(content_hash: &str) -> Option<String> {
+    if content_hash.is_empty() {
+        return None;
+    }
+    let conn = open();
+    init(&conn);
+    let author: String = conn
+        .query_row(
+            "SELECT author_peer_id FROM inferences WHERE content_hash = ?1 LIMIT 1",
+            params![content_hash],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    if author.is_empty() {
+        None
+    } else {
+        Some(author)
+    }
+}
+
+/// True when the stored record with this content hash was distributed by
+/// `peer_id` — the gate that lets ONLY an author retract their own work.
+pub fn record_author_matches(content_hash: &str, peer_id: &str) -> bool {
+    if content_hash.is_empty() || peer_id.is_empty() {
+        return false;
+    }
+    let conn = open();
+    init(&conn);
+    conn.query_row(
+        "SELECT COUNT(*) FROM inferences WHERE content_hash = ?1 AND author_peer_id = ?2",
+        params![content_hash, peer_id],
+        |r| {
+            let count: i64 = r.get(0)?;
+            Ok(count > 0)
+        },
+    )
+    .unwrap_or(false)
+}
+
 /// Deletes a record from local storage and adds a tombstone.
 /// Returns the content hash and simhash of the deleted record.
 pub fn delete_and_tombstone_record(record: &InferenceRecord, reason: &str) -> (String, u64) {
@@ -747,6 +930,7 @@ pub fn save_swarm_inference(
     provider: &str,
     model: &str,
     claimed_content_hash: &str,
+    author_peer_id: &str,
 ) -> Option<InferenceRecord> {
     save_inference_internal(
         question,
@@ -757,6 +941,7 @@ pub fn save_swarm_inference(
         Some(claimed_content_hash),
         true,
         false,
+        author_peer_id,
     )
 }
 
@@ -769,6 +954,7 @@ fn save_inference_internal(
     claimed_content_hash: Option<&str>,
     is_swarm: bool,
     is_truncated: bool,
+    author_peer_id: &str,
 ) -> Option<InferenceRecord> {
     // Defense-in-depth: sanitize before persisting so future UI surfaces
     // (GUI, web export) never encounter raw escape sequences from the DB.
@@ -795,6 +981,11 @@ fn save_inference_internal(
 
     // Tombstone Check: reject any content hash that has been tombstoned
     if is_tombstoned(&content_hash) {
+        return None;
+    }
+
+    // Publisher ban gate: a banned distributor's records are never accepted.
+    if !author_peer_id.is_empty() && is_banned(author_peer_id) {
         return None;
     }
 
@@ -834,8 +1025,8 @@ fn save_inference_internal(
     let publish_candidate = if !is_swarm { 1 } else { 0 };
 
     conn.execute(
-        "INSERT INTO inferences (timestamp, similarity, question, content, simhash, provider, model, content_hash, is_swarm, locality, is_truncated, publish_candidate)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "INSERT INTO inferences (timestamp, similarity, question, content, simhash, provider, model, content_hash, is_swarm, locality, is_truncated, publish_candidate, author_peer_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             ts,
             sim as f64,
@@ -849,6 +1040,7 @@ fn save_inference_internal(
             locality as f64,
             is_truncated as i64,
             publish_candidate,
+            author_peer_id,
         ],
     )
     .expect("failed to insert new inference");
@@ -1842,6 +2034,111 @@ pub fn toggle_publish_candidate(content_hash: &str, question: &str) -> Option<bo
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    static DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serializes DB tests against every other DB-touching test: MBHUB_DB
+    /// is process-wide env state, and cargo runs tests in parallel threads.
+    fn lock_db() -> (std::sync::MutexGuard<'static, ()>, std::sync::MutexGuard<'static, ()>) {
+        let guard_env = crate::env::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard_db = DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("MBHUB_DB", "mbhub_test.db");
+        }
+        (guard_env, guard_db)
+    }
+
+    #[test]
+    fn publisher_ban_deletes_records_and_blocks_reentry() {
+        let (_env_guard, _db_guard) = lock_db();
+        let _ = std::fs::remove_file("mbhub_test.db");
+
+        let author = "12D3KooWTestAuthorPeerId__________1234";
+        let rec = save_swarm_inference(
+            "What is Byzantine fault tolerance?",
+            "Byzantine fault tolerance keeps consensus safe when nodes lie.",
+            crate::simhash::compute_simhash("What is Byzantine fault tolerance?"),
+            "OpenAI",
+            "gpt-4o",
+            &crate::content_hash::compute_content_hash(
+                "What is Byzantine fault tolerance?",
+                "Byzantine fault tolerance keeps consensus safe when nodes lie.",
+                "OpenAI",
+                "gpt-4o",
+            ),
+            author,
+        )
+        .expect("saves before ban");
+        assert!(!is_banned(author));
+
+        // Ban: all of the publisher's records are deleted locally.
+        let deleted = ban_author(author, "User banned this publisher");
+        assert_eq!(deleted, 1);
+        assert!(is_banned(author));
+        assert_eq!(count_records(), 0, "records from banned author removed");
+
+        // Re-entry blocked: the same publisher cannot save again.
+        assert!(save_swarm_inference(
+            "Second attempt from banned author?",
+            "Second attempt content with enough length to pass gates.",
+            crate::simhash::compute_simhash("Second attempt from banned author?"),
+            "OpenAI",
+            "gpt-4o",
+            &crate::content_hash::compute_content_hash(
+                "Second attempt from banned author?",
+                "Second attempt content with enough length to pass gates.",
+                "OpenAI",
+                "gpt-4o",
+            ),
+            author,
+        )
+        .is_none());
+
+        // Ban list + unban lifecycle.
+        assert_eq!(banned_count(), 1);
+        assert_eq!(list_banned()[0].peer_id, author);
+        assert!(unban_author(author));
+        assert!(!is_banned(author));
+        assert_eq!(banned_count(), 0);
+
+        let _ = std::fs::remove_file("mbhub_test.db");
+        let _ = rec;
+        drop(_env_guard);
+        drop(_db_guard);
+    }
+
+    #[test]
+    fn record_author_matches_only_known_bindings() {
+        let (_env_guard, _db_guard) = lock_db();
+        let _ = std::fs::remove_file("mbhub_test.db");
+
+        let author = "12D3KooWTestAuthorPeerId__________5678";
+        let question = "How does gossipsub propagate messages?";
+        let content = "Gossipsub floods topic messages through the peer mesh reliably.";
+        let hash = crate::content_hash::compute_content_hash(question, content, "OpenAI", "gpt-4o");
+        save_swarm_inference(
+            question,
+            content,
+            crate::simhash::compute_simhash(question),
+            "OpenAI",
+            "gpt-4o",
+            &hash,
+            author,
+        )
+        .expect("saves");
+
+        // Author retraction gate: only the stored distributor matches.
+        assert!(record_author_matches(&hash, author));
+        assert!(!record_author_matches(&hash, "12D3KooWSomeoneElse____________________9999"));
+        assert!(!record_author_matches("f".repeat(64).as_str(), author));
+        assert!(!record_author_matches("", author));
+
+        let _ = std::fs::remove_file("mbhub_test.db");
+        drop(_env_guard);
+        drop(_db_guard);
+    }
+
     use super::*;
     use std::sync::Mutex;
 

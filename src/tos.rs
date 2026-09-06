@@ -6,14 +6,14 @@
 /// Current active version of the MBHub Terms of Service.
 /// Incrementing this string automatically triggers the mandatory review
 /// and re-acceptance gate for all peer nodes upon their next startup.
-pub const CURRENT_TOS_VERSION: &str = "1.0.0";
+pub const CURRENT_TOS_VERSION: &str = "2.0.0";
 
 /// Full, unabridged markdown text of the MBHub Terms of Service & Legal Framework.
 pub const TERMS_OF_SERVICE_TEXT: &str = r#"# MBHub Terms of Service & Legal Framework
 
-**Document Version:** 1.0.0  
-**Effective Date:** September 5, 2026  
-**License:** MIT License (Source Code) + Decentralized Operational Agreement  
+**Document Version:** 2.0.0  
+**Effective Date:** September 6, 2026  
+**License:** PolyForm Noncommercial 1.0.0 (Source Available) + Decentralized Operational Agreement  
 
 ---
 
@@ -32,10 +32,10 @@ This agreement governs your use of the MBHub client software ("Client"), the pee
 - **BYOK (Bring Your Own Key):** The sovereign operational model where the node operator provides and manages their own independent provider credentials.
 
 ### Section 3 — Nature of the Service
-MBHub is free, open-source, serverless software. There are no central servers, no user accounts, no administrative backdoors, and no corporate controllers. The Network is an emergent collective of autonomous peer nodes. No single entity or developer controls, operates, or assumes comprehensive liability for the Network. Network capacity, response latency, and coverage depend entirely on participating peers at any given moment; no uptime, answer completeness, or accuracy SLA is guaranteed.
+MBHub is serverless software, free to use for personal, educational, research, and other non-commercial purposes. There are no central servers, no user accounts, no administrative backdoors, and no corporate controllers. The Network is an emergent collective of autonomous peer nodes. No single entity or developer controls, operates, or assumes comprehensive liability for the Network. Network capacity, response latency, and coverage depend entirely on participating peers at any given moment; no uptime, answer completeness, or accuracy SLA is guaranteed.
 
-### Section 4 — Open Source Licensing & Operational Framework
-The MBHub Client source code is released under the permissive MIT License (see project repository). This document serves as an operational agreement outlining acceptable network rules, community defense obligations, content safety boundaries, and liability limitations not covered by the copyright license.
+### Section 4 — Licensing & Operational Framework
+The MBHub Client source code is made available under the **PolyForm Noncommercial License 1.0.0** (see the LICENSE file in the project repository). MBHub is therefore Source Available — anyone may inspect, audit, fork, learn from, and run the Client for personal, educational, research, and other non-commercial purposes. **Commercial use — including embedding the Client in a paid product, offering it as a paid service, or operating it as part of a revenue-generating internal workflow — requires a separate commercial license from the copyright holder** ([licensing@mbhub.dev](mailto:licensing@mbhub.dev); see LICENSING.md in the project repository). This document serves as an operational agreement outlining acceptable network rules, community defense obligations, content safety boundaries, and liability limitations not covered by the copyright license.
 
 ### Section 5 — User & Node Operator Obligations
 - When connecting to an AI Provider via BYOK, you are solely and exclusively responsible for complying with that Provider's respective Terms of Service and acceptable use policies. MBHub is not a party to that commercial relationship.
@@ -80,9 +80,12 @@ This agreement shall be governed by and construed in accordance with the laws of
 ### Section 16 — Severability
 If any provision of this agreement is determined to be unlawful, void, or unenforceable, that provision shall be deemed severable and shall not affect the validity and enforceability of any remaining provisions.
 
-### Section 17 — Contact & Open Source Verification
+### Section 17 — Contact, Licensing & Source Verification
 For inquiries, legal notices, audits, or contributions, refer to the official public GitHub repository:
 https://github.com/srcns/mbhub
+
+For commercial licensing, partnership, or acquisition inquiries:
+[licensing@mbhub.dev](mailto:licensing@mbhub.dev) — see also LICENSING.md in the project repository.
 
 ---
 

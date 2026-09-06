@@ -105,6 +105,9 @@ pub fn execute_ask(query: &str, p2p: Option<&P2pHandle>) -> Result<IpcResponse, 
                                 && inbound_safety.is_allowed()
                                 && !crate::db::is_tombstoned(&resp.content_hash)
                             {
+                                // L2 response: no authenticated author —
+                                // saved unattributed (content-level blocking
+                                // still applies).
                                 crate::db::save_swarm_inference(
                                     &resp.question,
                                     &resp.content,
@@ -112,6 +115,7 @@ pub fn execute_ask(query: &str, p2p: Option<&P2pHandle>) -> Result<IpcResponse, 
                                     &resp.provider,
                                     &resp.model,
                                     &resp.content_hash,
+                                    "",
                                 );
 
                                 return Ok(IpcResponse::Answer {
@@ -240,6 +244,8 @@ pub fn execute_ask(query: &str, p2p: Option<&P2pHandle>) -> Result<IpcResponse, 
                 content_hash,
                 hop_ttl: 8,
                 is_truncated: false,
+                pow: String::new(),
+                author_peer_id: String::new(),
             };
 
             // Outbound safety filter

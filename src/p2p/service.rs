@@ -325,6 +325,14 @@ fn build_swarm(
         // to circuit relay v2 when direct dialing is impossible (hard NAT).
         .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
         .with_behaviour(|keypair, relay_client| MbHubBehaviour::new(keypair, relay_client))?
+        .with_swarm_config(|c| {
+            // libp2p 0.56 closes connections after 10 s without open streams.
+            // Between swarm bursts (bootstrap, queries) that idle-kill made
+            // PEERS collapse to 0 and the L2 gate skip the swarm entirely.
+            // 600 s keeps the mesh warm: the 5/10-min kad re-bootstraps always
+            // land inside the window, so peers stay continuously reachable.
+            c.with_idle_connection_timeout(Duration::from_secs(600))
+        })
         .build())
 }
 
@@ -522,6 +530,9 @@ async fn run_swarm_loop(
     let mut peer_rates: HashMap<PeerId, PeerRate> = HashMap::new();
     // Public keys learned via identify — used to verify signed tombstones.
     let mut peer_keys: HashMap<PeerId, libp2p::identity::PublicKey> = HashMap::new();
+    // Unique connected peers (a peer may hold up to 2 connections) — the
+    // PEERS indicator reports distinct peers, not raw connection count.
+    let mut connected_set: HashSet<PeerId> = HashSet::new();
     let mut pending_publishes: VecDeque<PendingPublish> = VecDeque::new();
     let mut listen_addrs_seen: HashSet<String> = HashSet::new();
     let mut tick_counter: u64 = 0;
@@ -532,7 +543,7 @@ async fn run_swarm_loop(
                 tick_counter += 1;
 
                 // Drain outbound inferences
-                while let Ok(msg) = outbound_inf_rx.try_recv() {
+                while let Ok(mut msg) = outbound_inf_rx.try_recv() {
                     // Anti-Poison Hard Gate: defense-in-depth gate before wire transmission
                     if msg.content.trim().is_empty()
                         || msg.content.trim().len() < 10
@@ -541,6 +552,14 @@ async fn run_swarm_loop(
                         || msg.is_truncated
                     {
                         continue;
+                    }
+                    // Publish proof-of-work: raises the cost of flooding the
+                    // network with content, independent of identity count.
+                    if msg.pow.is_empty() {
+                        msg.pow = crate::p2p::protocol::solve_publish_pow(
+                            &keypair.public().encode_protobuf(),
+                            &msg.content_hash,
+                        );
                     }
                     if let Ok(json_bytes) = serde_json::to_vec(&msg) {
                         if json_bytes.len() <= MAX_GOSSIP_PAYLOAD {
@@ -700,6 +719,7 @@ async fn run_swarm_loop(
                     &my_peer_id_str,
                     &mut peer_rates,
                     &mut peer_keys,
+                    &mut connected_set,
                     &mut listen_addrs_seen,
                     &mut pending_publishes,
                     &topics,
@@ -764,6 +784,7 @@ fn handle_swarm_event(
     my_peer_id_str: &str,
     peer_rates: &mut HashMap<PeerId, PeerRate>,
     peer_keys: &mut HashMap<PeerId, libp2p::identity::PublicKey>,
+    connected_set: &mut HashSet<PeerId>,
     listen_addrs_seen: &mut HashSet<String>,
     pending_publishes: &mut VecDeque<PendingPublish>,
     topics: &GossipTopics,
@@ -781,8 +802,9 @@ fn handle_swarm_event(
             }
         }
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            connected_set.insert(peer_id);
             if let Ok(mut s) = status.write() {
-                s.connected_peers += 1;
+                s.connected_peers = connected_set.len();
                 log_line(&format!(
                     "[MBHub P2P] peer connected: {peer_id} (total {})",
                     s.connected_peers
@@ -791,8 +813,9 @@ fn handle_swarm_event(
         }
         SwarmEvent::ConnectionClosed { peer_id, .. } => {
             peer_keys.remove(&peer_id);
+            connected_set.remove(&peer_id);
             if let Ok(mut s) = status.write() {
-                s.connected_peers = s.connected_peers.saturating_sub(1);
+                s.connected_peers = connected_set.len();
                 log_line(&format!(
                     "[MBHub P2P] peer disconnected: {peer_id} (total {})",
                     s.connected_peers
@@ -1087,7 +1110,50 @@ fn handle_gossip_message(
             }
         }
     } else if message.topic == topics.inferences.hash() {
-        if let Ok(inference) = serde_json::from_slice::<SwarmInferenceMessage>(&message.data) {
+        if let Ok(mut inference) = serde_json::from_slice::<SwarmInferenceMessage>(&message.data) {
+            // Authenticated author binding: the distributor is the signed
+            // gossip author, never a self-declared field. Refuse messages
+            // that lie about their own authorship.
+            let Some(source) = message.source else {
+                return;
+            };
+            if inference.author_peer_id.is_empty() {
+                inference.author_peer_id = source.to_string();
+            } else if inference.author_peer_id != source.to_string() {
+                log_line(&format!(
+                    "[MBHub P2P] dropped inference: author field ({}) does not match gossip author ({source})",
+                    inference.author_peer_id
+                ));
+                return;
+            }
+            // Local publisher ban gate: banned distributors' records are
+            // never processed (and never reach the database).
+            if crate::db::is_banned(&inference.author_peer_id) {
+                log_line(&format!(
+                    "[MBHub P2P] dropped inference: author {} is locally banned",
+                    inference.author_peer_id
+                ));
+                return;
+            }
+            // Publish proof-of-work gate: without valid work from the
+            // author's key, content is not accepted at all.
+            let pow_ok = peer_keys
+                .get(&source)
+                .map(|pk| {
+                    crate::p2p::protocol::verify_publish_pow(
+                        &pk.encode_protobuf(),
+                        &inference.content_hash,
+                        &inference.pow,
+                        crate::p2p::protocol::PUBLISH_POW_DIFFICULTY_BITS,
+                    )
+                })
+                .unwrap_or(false);
+            if !pow_ok {
+                log_line(&format!(
+                    "[MBHub P2P] dropped inference from {source}: invalid/missing publish PoW"
+                ));
+                return;
+            }
             // Anti-Poison Hard Gate: drop answerless / empty / short / truncated inferences immediately
             if !inference.content.trim().is_empty()
                 && inference.content.trim().len() >= 10
@@ -1139,6 +1205,17 @@ fn handle_tombstone_message(
     if !tomb.passes_integrity_checks(chrono::Local::now().timestamp()) {
         log_line(&format!(
             "[MBHub P2P] dropped tombstone from {source}: integrity check failed"
+        ));
+        return;
+    }
+    // Author-retraction only: a tombstone is honored when the reporter is
+    // the stored distributor of this exact content — a publisher retracting
+    // their own work. Third-party negative signals are ignored: every user
+    // curates their own network, and no peer can delete what they did not
+    // author.
+    if !crate::db::record_author_matches(&tomb.content_hash, &source.to_string()) {
+        log_line(&format!(
+            "[MBHub P2P] ignored tombstone from {source}: third-party signals never delete"
         ));
         return;
     }
@@ -1272,9 +1349,10 @@ mod tests {
             .expect("tokio runtime");
 
         rt.block_on(async {
+            let keypair_b = Keypair::generate_ed25519();
             let swarm_a = build_swarm(&Keypair::generate_ed25519()).expect("swarm A builds");
             let mut swarm_a = swarm_a;
-            let swarm_b = build_swarm(&Keypair::generate_ed25519()).expect("swarm B builds");
+            let swarm_b = build_swarm(&keypair_b).expect("swarm B builds");
             let mut swarm_b = swarm_b;
 
             let topic = IdentTopic::new(GOSSIP_TOPIC_INFERENCES);
@@ -1334,8 +1412,12 @@ mod tests {
                 content_hash: String::new(),
                 hop_ttl: MAX_HOP_TTL,
                 is_truncated: false,
+                pow: String::new(),
+                author_peer_id: String::new(),
             };
             msg.content_hash = msg.canonical_content_hash();
+            // The receiver enforces the publish proof-of-work gate.
+            msg.pow = crate::p2p::protocol::solve_publish_pow(&keypair_b.public().encode_protobuf(), &msg.content_hash);
             let payload = serde_json::to_vec(&msg).expect("serializes");
 
             // GossipSub mesh membership settles a heartbeat or two after the

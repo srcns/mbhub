@@ -47,10 +47,19 @@ pub enum SettingsField {
     // Maintenance & Legal
     BackupDatabase,
     RestoreDatabase,
+    BannedAuthors,
     #[cfg_attr(not(feature = "publisher"), allow(dead_code))]
     SyncWebArchive,
     ClearCache,
     TermsOfService,
+}
+
+/// Viewer delete confirmation modal state. `has_author` = the record has a
+/// known publisher, which enables the publisher-level enforcement option.
+#[derive(Clone, Debug)]
+pub struct DeletePrompt {
+    pub has_author: bool,
+    pub record: crate::model::InferenceRecord,
 }
 
 #[derive(Clone, Debug)]
@@ -334,6 +343,8 @@ pub struct App {
     /// Receiver for the running web-archive sync (publisher builds only).
     #[cfg(feature = "publisher")]
     pub pending_sync: Option<crossbeam_channel::Receiver<crate::cms::SyncOutcome>>,
+    /// Viewer delete confirmation modal — captures input while open.
+    pub delete_prompt: Option<DeletePrompt>,
     /// Transient web-archive sync indicator shown in the header bar.
     #[cfg(feature = "publisher")]
     pub sync_status: Option<SyncStatus>,
@@ -415,6 +426,7 @@ impl App {
             p2p,
             pending_query: None,
             active_stream: None,
+            delete_prompt: None,
             #[cfg(feature = "publisher")]
             pending_sync: None,
             #[cfg(feature = "publisher")]
@@ -533,6 +545,7 @@ impl App {
         fields.push(SettingsField::ApiKey);
         fields.push(SettingsField::BackupDatabase);
         fields.push(SettingsField::RestoreDatabase);
+        fields.push(SettingsField::BannedAuthors);
         #[cfg(feature = "publisher")]
         if crate::cms::cms_dir().is_some() || std::env::var("MBHUB_PUBLISHER").is_ok() {
             fields.push(SettingsField::SyncWebArchive);
@@ -728,6 +741,12 @@ impl App {
             return;
         }
 
+        // Viewer delete confirmation modal: captures all input while open.
+        if self.delete_prompt.is_some() {
+            self.handle_delete_prompt_key(key);
+            return;
+        }
+
         // When the full-screen markdown viewer is open:
         if self.viewer.is_some() {
             self.handle_viewer_key(key);
@@ -806,6 +825,14 @@ impl App {
                             .provider_selected_models
                             .insert(provider_name.to_string(), model.clone());
                         crate::env::set_model_for_provider(provider_name, &model);
+                    }
+                }
+                SettingsField::BannedAuthors => {
+                    if let Some(item) = picker.items.get(idx) {
+                        // Items render as "<peer_id> · <reason> · <date>".
+                        if let Some(peer_id) = item.split(" · ").next() {
+                            db::unban_author(peer_id);
+                        }
                     }
                 }
                 _ => {}
@@ -927,23 +954,20 @@ impl App {
                 }
             }
             KeyCode::Delete | KeyCode::Char('d') => {
-                let rec = self.viewer.as_ref().and_then(|v| v.record.clone());
-                if let Some(record) = rec {
-                    let (hash, simhash) = crate::db::delete_and_tombstone_record(&record, "User deleted answer via viewer");
-                    if let Some(p) = &self.p2p {
-                        p.broadcast_tombstone(crate::p2p::SwarmTombstoneMessage {
-                            content_hash: hash,
-                            simhash,
-                            timestamp: chrono::Local::now().timestamp(),
-                            reporter_peer_id: p.peer_id(),
-                            reason: "User deleted answer".to_string(),
-                            signature: Vec::new(),
-                        });
+                // Open the scope-confirmation modal: the user chooses between
+                // content-level and publisher-level enforcement.
+                if let Some(record) = self.viewer.as_ref().and_then(|v| v.record.clone()) {
+                    let mut hash = record.content_hash.clone();
+                    if hash.is_empty() {
+                        hash = crate::content_hash::compute_content_hash(
+                            &record.question,
+                            &record.content,
+                            &record.provider,
+                            &record.model,
+                        );
                     }
-                    self.viewer = None;
-                    self.pending_query = None;
-                    self.active_stream = None;
-                    self.reload_records();
+                    let has_author = db::get_author_peer_id_by_hash(&hash).is_some();
+                    self.delete_prompt = Some(DeletePrompt { has_author, record });
                 }
             }
             KeyCode::End | KeyCode::Char('G') => {
@@ -953,6 +977,91 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Handles keys while the viewer delete confirmation modal is open.
+    fn handle_delete_prompt_key(&mut self, key: KeyEvent) {
+        let (record, has_author) = match self.delete_prompt.as_ref() {
+            Some(p) => (p.record.clone(), p.has_author),
+            None => return,
+        };
+        match key.code {
+            KeyCode::Char('1') => self.execute_delete(record, false),
+            KeyCode::Char('2') => self.execute_delete(record, has_author),
+            KeyCode::Esc => self.delete_prompt = None,
+            _ => {}
+        }
+    }
+
+    /// Executes the viewer deletion with the chosen enforcement scope.
+    ///
+    /// Scope 1 (content-only): the record's hash enters local tombstones —
+    /// permanent, hash-bound, survives identity changes.
+    /// Scope 2 (publisher): additionally bans the record's distributor on
+    /// this node — ALL of their records are deleted and never accepted
+    /// again. Both scopes are strictly LOCAL: they never propagate, and
+    /// third-party deletions elsewhere cannot affect this node.
+    fn execute_delete(&mut self, record: crate::model::InferenceRecord, ban_publisher: bool) {
+        let mut hash = record.content_hash.clone();
+        if hash.is_empty() {
+            hash = crate::content_hash::compute_content_hash(
+                &record.question,
+                &record.content,
+                &record.provider,
+                &record.model,
+            );
+        }
+        let author = db::get_author_peer_id_by_hash(&hash).unwrap_or_default();
+        let is_self_author = self
+            .p2p
+            .as_ref()
+            .map(|p| author == p.peer_id())
+            .unwrap_or(false);
+
+        // 1. Content-level: local delete + permanent hash tombstone.
+        let (hash, simhash) =
+            db::delete_and_tombstone_record(&record, "User deleted answer via viewer");
+
+        // 2. Publisher-level: ban the distributor (removes ALL of their
+        //    records from this node; future ones are never accepted).
+        if ban_publisher && !author.is_empty() {
+            db::ban_author(&author, "User banned this publisher via viewer");
+        }
+
+        // 3. Broadcast ONLY an author retraction: deleting your own work
+        //    tells the network to drop it. Third-party deletions never
+        //    propagate (receivers ignore them by design).
+        if is_self_author {
+            if let Some(p) = &self.p2p {
+                p.broadcast_tombstone(crate::p2p::SwarmTombstoneMessage {
+                    content_hash: hash,
+                    simhash,
+                    timestamp: chrono::Local::now().timestamp(),
+                    reporter_peer_id: p.peer_id(),
+                    reason: "Author retracted this answer".to_string(),
+                    signature: Vec::new(),
+                });
+            }
+        }
+
+        // Publisher builds: keep the web archive in sync after deletions
+        // (maintainer-only, never distributed).
+        #[cfg(feature = "publisher")]
+        trigger_cms_sync_background();
+
+        self.delete_prompt = None;
+        if self.viewer.take().is_some() {
+            self.pending_query = None;
+            self.active_stream = None;
+        }
+        self.reload_records();
+        // Keep the Memory cursor inside the shrunken window after a
+        // publisher-level deletion.
+        if self.total_records > 0 && self.memory_selected >= self.total_records {
+            self.memory_selected = self.total_records - 1;
+        }
+        self.scroll_into_view();
+        self.ensure_window();
     }
 
     /// Periodic tick called by the event loop to process streaming tokens,
@@ -1038,6 +1147,9 @@ impl App {
                     }
 
                     // 4. Persist as swarm-sourced (verified hash + replay dedupe).
+                    // L2 responses carry no authenticated author (the
+                    // responder id is self-declared) — saved unattributed;
+                    // only content-level blocking applies to them.
                     let Some(record) = db::save_swarm_inference(
                         &resp.question,
                         &resp.content,
@@ -1045,6 +1157,7 @@ impl App {
                         &resp.provider,
                         &resp.model,
                         &resp.content_hash,
+                        "",
                     ) else {
                         continue;
                     };
@@ -1184,6 +1297,7 @@ impl App {
                 &msg.provider,
                 &msg.model,
                 &msg.content_hash,
+                &msg.author_peer_id,
             ) {
                 self.insert_record(record);
                 let _ = db::enforce_storage_limit_gb(self.settings.reserved_gb, self.settings.sharding_mode == ShardingMode::QueryLocality);
@@ -1254,6 +1368,8 @@ impl App {
             content_hash,
             hop_ttl: crate::p2p::MAX_HOP_TTL,
             is_truncated: false,
+            pow: String::new(),
+            author_peer_id: String::new(),
         };
 
         // Content safety stage-1: gate before gossip announce.
@@ -1536,28 +1652,20 @@ impl App {
             }
             KeyCode::Delete | KeyCode::Char('d') => {
                 if self.total_records > 0 && self.memory_selected < self.total_records {
+                    // Same scope-confirmation modal as the viewer: the user
+                    // chooses content-level vs publisher-level enforcement.
                     if let Some(record) = self.get_memory_record(self.memory_selected) {
-                        let (hash, simhash) = crate::db::delete_and_tombstone_record(&record, "User deleted memory entry");
-                        if let Some(p) = &self.p2p {
-                            p.broadcast_tombstone(crate::p2p::SwarmTombstoneMessage {
-                                content_hash: hash,
-                                simhash,
-                                timestamp: chrono::Local::now().timestamp(),
-                                reporter_peer_id: p.peer_id(),
-                                reason: "User deleted memory entry".to_string(),
-                                signature: Vec::new(),
-                            });
+                        let mut hash = record.content_hash.clone();
+                        if hash.is_empty() {
+                            hash = crate::content_hash::compute_content_hash(
+                                &record.question,
+                                &record.content,
+                                &record.provider,
+                                &record.model,
+                            );
                         }
-                        // Two-way deletion: publisher builds also prune the
-                        // web archive (maintainer-only, never distributed).
-                        #[cfg(feature = "publisher")]
-                        trigger_cms_sync_background();
-                        self.reload_records();
-                        if self.total_records > 0 && self.memory_selected >= self.total_records {
-                            self.memory_selected = self.total_records - 1;
-                        }
-                        self.scroll_into_view();
-                        self.ensure_window();
+                        let has_author = db::get_author_peer_id_by_hash(&hash).is_some();
+                        self.delete_prompt = Some(DeletePrompt { has_author, record });
                     }
                 }
             }
@@ -1666,6 +1774,7 @@ impl App {
     /// Left/Right changes a selector's value quickly; Enter opens the Modal Picker.
     fn value_step(&mut self, delta: isize) {
         match self.focus {
+            SettingsField::BannedAuthors => {}
             SettingsField::DateFormat => {
                 let n = DateFormat::ALL.len() as isize;
                 let idx = (DateFormat::ALL
@@ -1847,6 +1956,26 @@ impl App {
                     "Restore Database: Select Backup (.db) File".to_string(),
                     FileBrowserMode::SelectFile,
                 ));
+            }
+            SettingsField::BannedAuthors => {
+                let banned = db::list_banned();
+                if !banned.is_empty() {
+                    let items = banned
+                        .iter()
+                        .map(|b| {
+                            let date = chrono::DateTime::from_timestamp(b.banned_at, 0)
+                                .map(|d| d.format("%Y-%m-%d").to_string())
+                                .unwrap_or_default();
+                            format!("{} · {} · {}", b.peer_id, b.reason, date)
+                        })
+                        .collect();
+                    self.picker_modal = Some(PickerModal::new(
+                        "Banned publishers — Enter: lift ban (future records)".to_string(),
+                        items,
+                        0,
+                        SettingsField::BannedAuthors,
+                    ));
+                }
             }
             #[cfg(feature = "publisher")]
             SettingsField::SyncWebArchive => {

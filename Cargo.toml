@@ -1,6 +1,6 @@
 [package]
 name = "mbhub"
-version = "1.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "Sovereign, serverless P2P collective memory network for atomic AI answers"
 license = "MIT"
@@ -33,6 +33,7 @@ sha2 = "0.10"
 # archive pipeline and is never distributed.
 [features]
 default = []
+publisher = []
 
 # v1.0 release binaries: small, fast, stripped.
 [profile.release]
@@ -40,8 +41,3 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
-
-# The maintainer-only `publisher` cfg exists in the shared source but its
-# feature/flag is intentionally not declared in this public tree.
-[lints.rust]
-unexpected_cfgs = { level = "allow" }

@@ -20,6 +20,14 @@ const DATE_W: usize = 16; // "01.01.2026 20:00" is the widest date
 const HIT_W: usize = 7;  // "HIT (%)" header + right-aligned "99.99"
 const GAP: usize = 2;
 
+/// Width of the "[WEB] " badge column. Publisher builds reserve it so web
+/// rows align with non-web rows; public builds have no badge at all —
+/// reserving the space there left a dead 6-char gap before every row.
+#[cfg(feature = "publisher")]
+const BADGE_W: usize = 6;
+#[cfg(not(feature = "publisher"))]
+const BADGE_W: usize = 0;
+
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     let rows =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
@@ -125,20 +133,19 @@ fn row_item(
 ) -> ListItem<'static> {
     let date = fmt.format(&r.ts);
     let clean_preview = crate::sanitize::strip_control_chars(r.preview());
-    let question = fit(&clean_preview, content_w.saturating_sub(6));
+    let question = fit(&clean_preview, content_w.saturating_sub(BADGE_W));
 
+    // Publisher builds: green "[WEB] " for web rows, matching blanks for the
+    // rest so the column stays aligned. Public builds: zero-width — the
+    // question starts flush after the DATE column with no dead gap.
+    #[cfg(feature = "publisher")]
     let web_badge = if r.publish_candidate {
-        #[cfg(feature = "publisher")]
-        {
-            Span::styled("[WEB] ", ratatui::style::Style::default().fg(ratatui::style::Color::Green))
-        }
-        #[cfg(not(feature = "publisher"))]
-        {
-            Span::raw("      ")
-        }
+        Span::styled("[WEB] ", ratatui::style::Style::default().fg(ratatui::style::Color::Green))
     } else {
-        Span::raw("      ")
+        Span::raw(" ".repeat(BADGE_W))
     };
+    #[cfg(not(feature = "publisher"))]
+    let web_badge = Span::raw("");
 
     if is_blind {
         ListItem::new(Line::from(vec![

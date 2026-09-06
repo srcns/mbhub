@@ -41,5 +41,71 @@ pub fn render(frame: &mut Frame, app: &App) {
         }
     }
 
+    // Viewer delete confirmation overlay — captures all input while open.
+    if let Some(prompt) = &app.delete_prompt {
+        if app.viewer.is_some() {
+            draw_delete_prompt(frame, body, prompt);
+        }
+    }
+
     footer::draw(frame, rows[2], app);
+}
+
+/// Centered confirmation overlay for the viewer delete flow.
+fn draw_delete_prompt(frame: &mut Frame, area: Rect, prompt: &crate::app::DeletePrompt) {
+    use ratatui::style::{Color, Style};
+    use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+    use ratatui::text::{Line, Span};
+
+    let height: u16 = if prompt.has_author { 8 } else { 7 };
+    let width: u16 = 66.min(area.width.saturating_sub(4));
+
+    let vert = ratatui::layout::Layout::vertical([
+        ratatui::layout::Constraint::Fill(1),
+        ratatui::layout::Constraint::Length(height),
+        ratatui::layout::Constraint::Fill(1),
+    ])
+    .split(area);
+    let horiz = ratatui::layout::Layout::horizontal([
+        ratatui::layout::Constraint::Fill(1),
+        ratatui::layout::Constraint::Length(width),
+        ratatui::layout::Constraint::Fill(1),
+    ])
+    .split(vert[1]);
+
+    let muted = Style::default().fg(Color::DarkGray);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "1 · Delete & block THIS content only",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            "     permanent local tombstone — survives identity changes",
+            muted,
+        )),
+    ];
+    if prompt.has_author {
+        lines.push(Line::from(Span::styled(
+            "2 · Delete & block EVERYTHING from this publisher",
+            Style::default().fg(Color::Red),
+        )));
+        lines.push(Line::from(Span::styled(
+            "     permanent local ban — their records never return",
+            muted,
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "   (publisher unknown for this record — content-level only)",
+            muted,
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Esc · Cancel", muted)));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green))
+        .title(" Delete this record? ");
+    frame.render_widget(ratatui::widgets::Clear, horiz[1]);
+    frame.render_widget(Paragraph::new(lines).block(block), horiz[1]);
 }

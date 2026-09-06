@@ -9,11 +9,18 @@
   <strong>The Torrent of Thought: A serverless, decentralized inference cache and collaborative memory layer for AI.</strong>
 </p>
 
+<div align="center">
+
+<strong>Source Available · Non-Commercial</strong> — licensed under the <a href="LICENSE">PolyForm Noncommercial 1.0.0</a>.<br>
+Free for personal, educational, research, and other non-commercial use. <strong>Commercial use requires a separate license</strong> — see <a href="LICENSING.md">LICENSING.md</a> or contact <a href="mailto:licensing@mbhub.dev">licensing@mbhub.dev</a>.
+
+</div>
+
 <p align="center">
   <a href="https://github.com/srcns/mbhub/actions"><img src="https://img.shields.io/badge/tests-150%20passed-brightgreen.svg" alt="Tests"></a>
   <a href="https://github.com/srcns/mbhub"><img src="https://img.shields.io/badge/rust-2024%20edition-orange.svg" alt="Rust Edition"></a>
   <a href="https://github.com/srcns/mbhub"><img src="https://img.shields.io/badge/p2p-libp2p%20%2B%20noise-blue.svg" alt="P2P Protocol"></a>
-  <a href="https://github.com/srcns/mbhub"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-PolyForm%20NC%201.0.0-blueviolet.svg" alt="License: PolyForm Noncommercial"></a>
   <a href="https://mbhub.dev"><img src="https://img.shields.io/badge/web-mbhub.dev-26A269.svg" alt="Website"></a>
 </p>
 

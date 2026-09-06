@@ -1,0 +1,46 @@
+name: "Commercial licensing inquiry"
+description: "Ask about commercial use, licensing terms, or partnership/acquisition"
+title: "[Commercial] "
+labels: ["licensing"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        MBHub is Source Available under the PolyForm Noncommercial 1.0.0 —
+        free for personal, educational, research, and non-commercial use.
+        Commercial use requires a separate license from the copyright holder.
+        See [LICENSING.md](../blob/main/LICENSING.md) for the full policy.
+  - type: input
+    id: organization
+    attributes:
+      label: "Company / organization"
+      placeholder: "Acme Corp."
+    validations:
+      required: true
+  - type: dropdown
+    id: use-case
+    attributes:
+      label: "Intended use"
+      options:
+        - "Embed in a paid product"
+        - "Offer as a paid SaaS / hosted service"
+        - "Company-internal production workflow"
+        - "Redistribution / derivative distribution"
+        - "Partnership / acquisition inquiry"
+        - "Other (describe below)"
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: "Details"
+      placeholder: "Describe the intended use, scale (seats/instances/regions), and timeline."
+    validations:
+      required: true
+  - type: input
+    id: contact
+    attributes:
+      label: "Contact e-mail"
+      placeholder: "you@company.com"
+    validations:
+      required: true

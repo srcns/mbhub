@@ -72,6 +72,7 @@ pub fn run_daemon(accept_terms: bool) -> std::io::Result<()> {
                         &inf.provider,
                         &inf.model,
                         &inf.content_hash,
+                        &inf.author_peer_id,
                     );
                 }
             }

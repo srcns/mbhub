@@ -209,6 +209,16 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                         false,
                     );
                 }
+                SettingsField::BannedAuthors => {
+                    row(
+                        frame,
+                        rows[row_idx],
+                        "Banned publishers",
+                        &format!("{} active", crate::db::banned_count()),
+                        focus == SettingsField::BannedAuthors,
+                        false,
+                    );
+                }
                 SettingsField::RestoreDatabase => {
                     row(
                         frame,
@@ -452,6 +462,11 @@ fn field_help(
             "Restore database (Import)",
             "Restores a previously exported .db backup file. Your live SQLite database will be replaced with this snapshot, and all restored records will be immediately browsable in Memory.",
             "Enter : open file manager",
+        ),
+        SettingsField::BannedAuthors => (
+            "Banned publishers",
+            "Publishers you have locally banned: all of their records were removed from this node and new ones are never accepted. Bans are permanent and never propagate to other users — select a publisher below to lift the ban (already-deleted records are not restored).",
+            "Enter : manage banned publishers",
         ),
         #[cfg(feature = "publisher")]
         SettingsField::SyncWebArchive => (

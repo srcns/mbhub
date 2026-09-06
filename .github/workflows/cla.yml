@@ -1,0 +1,37 @@
+# CLA Assistant — enforces the Individual Contributor License Agreement
+# (CLA.md) on every pull request. Contributors sign with one click; unsigned
+# PRs cannot be merged (enforced via branch protection on `main`).
+#
+# SETUP (one-time, maintainer):
+#   1. Create a Personal Access Token (classic) with `repo` + `workflow` scopes.
+#   2. Store it:  gh secret set CLA_PAT --repo srcns/mbhub
+# Signatures are committed to the `cla-signatures` branch.
+
+name: "CLA Assistant"
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+jobs:
+  cla:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "CLA Assistant"
+        if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') || github.event_name == 'pull_request_target'
+        uses: contributor-assistant/github-action@v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_PAT }}
+        with:
+          path-to-signatures: "signatures/cla.json"
+          path-to-document: "https://github.com/srcns/mbhub/blob/main/CLA.md"
+          branch: "cla-signatures"
+          allowlist: "dependabot[bot],renovate[bot],github-actions[bot]"

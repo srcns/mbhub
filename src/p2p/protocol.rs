@@ -46,6 +46,93 @@ pub struct SwarmInferenceMessage {
     pub hop_ttl: u8,
     #[serde(default)]
     pub is_truncated: bool,
+    /// Publish proof-of-work: a nonce whose BLAKE3 hash over
+    /// (author pubkey ‖ content_hash ‖ nonce) has
+    /// [`PUBLISH_POW_DIFFICULTY_BITS`] leading zero bits. Raises the cost of
+    /// flooding the network with content, independent of identity count.
+    #[serde(default)]
+    pub pow: String,
+    /// Gossip-authenticated distributor of this record. Transport metadata:
+    /// never serialized (receivers derive it from the signed gossip author,
+    /// which cannot be spoofed). Powers local publisher bans.
+    #[serde(skip)]
+    pub author_peer_id: String,
+}
+
+/// Leading zero bits required in the publish proof-of-work hash. ~1-2 s of
+/// single-core BLAKE3 per published inference — negligible for honest nodes
+/// (one solve per L3 answer), a real cost for identity-farming flooders.
+pub const PUBLISH_POW_DIFFICULTY_BITS: u32 = 24;
+
+/// Computes the publish proof-of-work hash for one nonce attempt.
+fn pow_hash(author_pubkey: &[u8], content_hash: &str, nonce: u64) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(author_pubkey);
+    hasher.update(content_hash.as_bytes());
+    hasher.update(&nonce.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// Precomputed prefix state for the solver: the pubkey and content hash are
+/// constant across nonce attempts, so the solver clones the mid-state and
+/// only folds the 8 nonce bytes per attempt.
+fn pow_prefix(author_pubkey: &[u8], content_hash: &str) -> blake3::Hasher {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(author_pubkey);
+    hasher.update(content_hash.as_bytes());
+    hasher
+}
+
+/// Counts leading zero bits of a 32-byte hash.
+fn leading_zero_bits(hash: &[u8; 32]) -> u32 {
+    let mut bits = 0u32;
+    for &byte in hash {
+        if byte == 0 {
+            bits += 8;
+        } else {
+            bits += byte.leading_zeros();
+            break;
+        }
+    }
+    bits
+}
+
+/// Solves the publish proof-of-work for one inference. Returns the nonce as
+/// a decimal string (bounded: difficulty 28 ≈ 2^28 attempts ≈ well under a
+/// second on modern hardware).
+pub fn solve_publish_pow(author_pubkey: &[u8], content_hash: &str) -> String {
+    solve_publish_pow_with_difficulty(author_pubkey, content_hash, PUBLISH_POW_DIFFICULTY_BITS)
+}
+
+/// Difficulty-injectable solver (tests use a lower difficulty).
+pub fn solve_publish_pow_with_difficulty(
+    author_pubkey: &[u8],
+    content_hash: &str,
+    difficulty_bits: u32,
+) -> String {
+    let prefix = pow_prefix(author_pubkey, content_hash);
+    let mut nonce: u64 = 0;
+    loop {
+        let mut attempt = prefix.clone();
+        attempt.update(&nonce.to_le_bytes());
+        if leading_zero_bits(attempt.finalize().as_bytes()) >= difficulty_bits {
+            return nonce.to_string();
+        }
+        nonce = nonce.wrapping_add(1);
+    }
+}
+
+/// Verifies a publish proof-of-work against the author's public key.
+pub fn verify_publish_pow(
+    author_pubkey: &[u8],
+    content_hash: &str,
+    pow: &str,
+    difficulty_bits: u32,
+) -> bool {
+    let Ok(nonce) = pow.trim().parse::<u64>() else {
+        return false;
+    };
+    leading_zero_bits(&pow_hash(author_pubkey, content_hash, nonce)) >= difficulty_bits
 }
 
 impl SwarmInferenceMessage {
@@ -229,6 +316,33 @@ impl SwarmQueryResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libp2p::identity::Keypair;
+
+    #[test]
+    fn publish_pow_roundtrip_and_tamper() {
+        let keypair = Keypair::generate_ed25519();
+        let pubkey = keypair.public().encode_protobuf();
+        let content_hash = "a".repeat(64);
+
+        // Low-difficulty solve (fast test), verified at the same difficulty.
+        let pow = solve_publish_pow_with_difficulty(&pubkey, &content_hash, 12);
+        assert!(verify_publish_pow(&pubkey, &content_hash, &pow, 12));
+
+        // A different key fails verification (PoW is author-bound).
+        let other = Keypair::generate_ed25519();
+        assert!(!verify_publish_pow(
+            &other.public().encode_protobuf(),
+            &content_hash,
+            &pow,
+            12
+        ));
+
+        // Different content fails verification.
+        assert!(!verify_publish_pow(&pubkey, &"b".repeat(64), &pow, 12));
+
+        // Garbage nonce fails.
+        assert!(!verify_publish_pow(&pubkey, &content_hash, "not-a-number", 12));
+    }
 
     fn sample_message() -> SwarmInferenceMessage {
         SwarmInferenceMessage {
@@ -241,6 +355,8 @@ mod tests {
             content_hash: String::new(),
             hop_ttl: MAX_HOP_TTL,
             is_truncated: false,
+            pow: String::new(),
+            author_peer_id: String::new(),
         }
     }
 

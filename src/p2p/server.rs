@@ -114,6 +114,12 @@ fn build_bootstrap_swarm(
             relay: libp2p::relay::Behaviour::new(peer_id, relay_server_config()),
             limits: libp2p::connection_limits::Behaviour::new(limits),
         })?
+        .with_swarm_config(|c| {
+            // Rendezvous nodes must stay interconnected: the same libp2p 0.56
+            // 10 s idle timeout would let the server↔server link flap whenever
+            // both go quiet between DHT bursts.
+            c.with_idle_connection_timeout(Duration::from_secs(600))
+        })
         .build())
 }
 
