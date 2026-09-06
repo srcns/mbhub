@@ -5,6 +5,8 @@
 
 mod api;
 mod app;
+#[cfg(feature = "publisher")]
+mod cms;
 mod content_hash;
 mod content_safety;
 mod daemon;
@@ -67,6 +69,15 @@ fn main() -> io::Result<()> {
                 let accept_terms = args.iter().any(|a| a == "--accept-terms");
                 return daemon::run_daemon(accept_terms);
             }
+            "bootstrap" => {
+                // Dedicated rendezvous node (Kademlia server + relay server):
+                // runs on cheap VPS instances, carries no user content.
+                if let Err(e) = p2p::server::run_bootstrap_server() {
+                    eprintln!("Bootstrap node error: {e}");
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             "mcp" => {
                 let accept_terms = args.iter().any(|a| a == "--accept-terms");
                 return mcp::run_mcp_server(accept_terms);
@@ -89,6 +100,24 @@ fn main() -> io::Result<()> {
                 }
                 return Ok(());
             }
+            #[cfg(feature = "publisher")]
+            "export-blog" => {
+                return handle_cli_export_blog(&args[2..]);
+            }
+            #[cfg(feature = "publisher")]
+            "cms" => {
+                return handle_cli_cms(&args[2..]);
+            }
+            #[cfg(feature = "publisher")]
+            "simhash" => {
+                // Prints the 64-bit SimHash of each argument — used by the
+                // maintainer's archive rehydration pipeline to restore exact
+                // fingerprints without re-deriving them in JS.
+                for arg in &args[2..] {
+                    println!("{}", simhash::compute_simhash(arg));
+                }
+                return Ok(());
+            }
             "help" | "--help" | "-h" => {
                 print_cli_help();
                 return Ok(());
@@ -98,6 +127,15 @@ fn main() -> io::Result<()> {
     }
 
     run_tui()
+}
+
+/// Broken-pipe-safe stdout write: `mbhub ask ... | head` closes the pipe
+/// early; `println!` would panic on EPIPE, this just stops printing.
+fn print_line(text: &str) {
+    use std::io::Write;
+    let mut stdout = io::stdout();
+    let _ = writeln!(stdout, "{text}");
+    let _ = stdout.flush();
 }
 
 fn handle_cli_ask(args: &[String]) -> io::Result<()> {
@@ -179,12 +217,12 @@ fn handle_cli_ask(args: &[String]) -> io::Result<()> {
                     "source": source,
                     "similarity": similarity,
                 });
-                println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+                print_line(&serde_json::to_string_pretty(&out).unwrap_or_default());
             } else {
-                println!("# {}\n", question);
-                println!("{}\n", content);
-                println!("---");
-                println!("Source: {} | Hit Rate: {:.2}%", source, similarity);
+                print_line(&format!("# {question}\n"));
+                print_line(&format!("{content}\n"));
+                print_line("---");
+                print_line(&format!("Source: {source} | Hit Rate: {similarity:.2}%"));
             }
             Ok(())
         }
@@ -242,6 +280,282 @@ fn handle_cli_service(args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+/// Maintainer-only web archive pipeline (compiled exclusively into
+/// `--features publisher` builds and never distributed).
+#[cfg(feature = "publisher")]
+fn handle_cli_cms(args: &[String]) -> io::Result<()> {
+    if args.is_empty() {
+        println!("MBHub CMS & Web Publisher Management");
+        println!("Usage: mbhub cms <command>\n");
+        println!("Commands:");
+        println!("  sync        Execute export and deploy to mbhub.dev");
+        println!("  status      Show local candidates vs web archive statistics");
+        println!("  rehydrate   Restore local SQLite from content/ markdown files");
+        return Ok(());
+    }
+
+    let Some(cms_dir) = cms::cms_dir() else {
+        eprintln!("Error: no mbhub-cms repository found.");
+        eprintln!("Set MBHUB_CMS_DIR=<path> to the local web archive repository,");
+        eprintln!("or clone it into ~/.mbhub/cms and retry.");
+        std::process::exit(1);
+    };
+
+    // Pin the child pipeline to the exact database this process is using.
+    let db_path = db::db_path();
+
+    match args[0].as_str() {
+        "sync" => {
+            println!("[CMS] Triggering synchronous web archive build & deploy...");
+            let status = std::process::Command::new("node")
+                .arg("scripts/sync.js")
+                .current_dir(&cms_dir)
+                .env("MBHUB_DB", &db_path)
+                .status()?;
+            if status.success() {
+                println!("[CMS] Sync and deployment finished successfully.");
+            } else {
+                eprintln!("[CMS] Sync failed with exit code: {:?}", status.code());
+            }
+        }
+        "status" => {
+            println!("MBHub CMS Status:");
+            println!("Repository: {}", cms_dir.display());
+            let candidates = db::fetch_blog_export_candidates(0, true);
+            println!("Local Approved Candidates: {} inquiry(ies)", candidates.len());
+            let content_dir = cms_dir.join("content");
+            if content_dir.exists() {
+                let count = std::fs::read_dir(&content_dir)
+                    .map(|entries| {
+                        entries
+                            .filter_map(|e| e.ok())
+                            .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
+                            .count()
+                    })
+                    .unwrap_or(0);
+                println!("Live Content Files:       {} article(s)", count);
+            }
+        }
+        "rehydrate" => {
+            println!("[CMS] Rehydrating local SQLite from web content directory...");
+            let status = std::process::Command::new("node")
+                .arg("scripts/rehydrate.js")
+                .current_dir(&cms_dir)
+                .env("MBHUB_DB", &db_path)
+                .status()?;
+            if status.success() {
+                println!("[CMS] Rehydration finished successfully.");
+            } else {
+                eprintln!("[CMS] Rehydration failed with exit code: {:?}", status.code());
+            }
+        }
+        other => {
+            eprintln!("Unknown CMS command: {}. Available: sync, status, rehydrate", other);
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+/// Maintainer-only blog export (compiled exclusively into
+/// `--features publisher` builds and never distributed).
+#[cfg(feature = "publisher")]
+fn handle_cli_export_blog(args: &[String]) -> io::Result<()> {
+    use chrono::TimeZone;
+    let mut out_dir = None;
+    let mut export_all = false;
+    let mut dry_run = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" => {
+                if i + 1 < args.len() {
+                    out_dir = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            "--all" => export_all = true,
+            "--dry-run" => dry_run = true,
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let target_dir = out_dir.unwrap_or_else(|| {
+        if std::path::Path::new("../mbhub-cms/content").exists() {
+            "../mbhub-cms/content".to_string()
+        } else if std::path::Path::new("content").exists() {
+            "content".to_string()
+        } else {
+            "./blog-export".to_string()
+        }
+    });
+
+    let target_path = std::path::Path::new(&target_dir);
+    if !dry_run {
+        std::fs::create_dir_all(target_path)?;
+    }
+
+    let last_id = if export_all {
+        0
+    } else {
+        db::get_last_blog_export_id()
+    };
+
+    let candidates = db::fetch_blog_export_candidates(last_id, export_all);
+    if candidates.is_empty() {
+        println!("No new blog export candidates found (last processed ID: {last_id}).");
+        return Ok(());
+    }
+
+    println!("Found {} candidate(s) for blog export...", candidates.len());
+    let mut exported = 0;
+    let mut skipped = 0;
+    let mut highest_id = last_id;
+
+    for item in &candidates {
+        // Double-pass DLP verification (Phase 1 — Privacy & Secret Leakage Gate)
+        let dlp_q = dlp::scan_text(&item.question);
+        let dlp_c = dlp::scan_text(&item.content);
+        if dlp_q.is_sensitive || dlp_c.is_sensitive {
+            eprintln!(
+                "⚠️  DLP Gate intercepted record #{}: {:?} (question: {})",
+                item.id,
+                dlp_q.matched_pattern.or(dlp_c.matched_pattern),
+                item.question
+            );
+            skipped += 1;
+            continue;
+        }
+
+        // Double-pass Content Safety verification (Phase 1 — Content Integrity Gate)
+        let safety_q = content_safety::screen_text(&item.question);
+        let safety_c = content_safety::screen_text(&item.content);
+        if matches!(safety_q, content_safety::SafetyVerdict::Reject { .. })
+            || matches!(safety_c, content_safety::SafetyVerdict::Reject { .. })
+        {
+            eprintln!(
+                "⚠️  Content Safety Gate blocked record #{}: {}",
+                item.id, item.question
+            );
+            skipped += 1;
+            continue;
+        }
+
+        // Generate human-readable SEO question slug (e.g. /how-to-implement-distributed-consensus-in-rust)
+        let raw_key = format!("{}:{}", item.question, item.timestamp);
+        let hash_hex = blake3::hash(raw_key.as_bytes()).to_hex();
+        let base_slug = slugify(&item.question);
+        let clean_title = item.question.replace('"', "\\\"");
+
+        let base_file = target_path.join(format!("{base_slug}.md"));
+        let slug = if base_file.exists() {
+            // Check if existing file is for the same question
+            let is_same = if let Ok(existing) = std::fs::read_to_string(&base_file) {
+                existing.contains(&format!("title: \"{}\"", clean_title))
+                    || (!item.content_hash.is_empty() && existing.contains(&item.content_hash))
+            } else {
+                false
+            };
+
+            if is_same {
+                // If a legacy hash file existed, clean it up
+                let legacy_hash_file = target_path.join(format!("{base_slug}-{}.md", &hash_hex[..6]));
+                if legacy_hash_file.exists() && !dry_run {
+                    let _ = std::fs::remove_file(&legacy_hash_file);
+                }
+                base_slug
+            } else {
+                format!("{base_slug}-{}", &hash_hex[..6])
+            }
+        } else {
+            // Clean up any stray hash-suffixed file for this question
+            let legacy_hash_file = target_path.join(format!("{base_slug}-{}.md", &hash_hex[..6]));
+            if legacy_hash_file.exists() && !dry_run {
+                let _ = std::fs::remove_file(&legacy_hash_file);
+            }
+            base_slug
+        };
+
+        // Format ISO 8601 date in real UTC. The `Z` suffix must never be
+        // attached to a local-time value, or RSS/sitemap/JSON-LD dates drift
+        // by the local UTC offset.
+        let dt = chrono::Utc
+            .timestamp_opt(item.timestamp, 0)
+            .single()
+            .unwrap_or_else(chrono::Utc::now);
+        let date_str = dt.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+        let source_label = if item.is_swarm {
+            "L2"
+        } else if item.provider == "Local" {
+            "L1"
+        } else {
+            "L3"
+        };
+
+        let markdown = format!(
+            "---\ntitle: \"{clean_title}\"\nslug: \"{slug}\"\ndate: {date_str}\nsimilarity: {:.2}\nsource: \"{source_label}\"\nprovider: \"{provider}\"\nmodel: \"{model}\"\ncontent_hash: \"{content_hash}\"\nsimhash: {simhash}\nprovider_verified: false\n---\n\n{content}\n",
+            item.similarity,
+            provider = item.provider,
+            model = item.model,
+            content_hash = item.content_hash,
+            simhash = item.simhash,
+            content = item.content.trim()
+        );
+
+        let file_path = target_path.join(format!("{slug}.md"));
+        if dry_run {
+            println!("  [dry-run] Would export #{}: {} -> {:?}", item.id, item.question, file_path);
+        } else {
+            std::fs::write(&file_path, markdown)?;
+            db::mark_published(item.id, chrono::Local::now().timestamp());
+            if item.id > highest_id {
+                highest_id = item.id;
+            }
+        }
+        exported += 1;
+    }
+
+    if !dry_run && highest_id > last_id {
+        db::set_last_blog_export_id(highest_id);
+    }
+
+    println!(
+        "✓ Blog export complete: {exported} exported, {skipped} skipped. Target: {}",
+        target_path.display()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "publisher")]
+fn slugify(text: &str) -> String {
+    let transliterated = text
+        .replace('ı', "i").replace('İ', "i")
+        .replace('ğ', "g").replace('Ğ', "g")
+        .replace('ü', "u").replace('Ü', "u")
+        .replace('ş', "s").replace('Ş', "s")
+        .replace('ö', "o").replace('Ö', "o")
+        .replace('ç', "c").replace('Ç', "c");
+    let mut slug = String::new();
+    let mut prev_dash = true;
+    for ch in transliterated.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = slug.trim_matches('-');
+    if trimmed.is_empty() {
+        "question".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
 
 fn print_cli_help() {
     println!("MBHub — Sovereign P2P Collective AI Memory (v{})", env!("CARGO_PKG_VERSION"));
@@ -249,7 +563,14 @@ fn print_cli_help() {
     println!("  mbhub                     Launch the interactive retro terminal UI");
     println!("  mbhub ask <query> [--json] Ask a question via headless 3-layer pipeline");
     println!("  mbhub daemon              Run the 24/7 background P2P & IPC daemon");
+    println!("  mbhub bootstrap           Run a dedicated rendezvous node (Kademlia + relay server, no data)");
     println!("  mbhub mcp [--accept-terms] Start stdio JSON-RPC 2.0 MCP server (Cursor, Claude, agents)");
+    #[cfg(feature = "publisher")]
+    {
+        println!("  mbhub export-blog [--out <dir>] [--all] Export local Q&A records to Astro markdown");
+        println!("  mbhub cms <sync|status|rehydrate> Manage the local web archive pipeline");
+        println!("  mbhub simhash <text>      Print the 64-bit SimHash fingerprint of text");
+    }
     println!("  mbhub status              Check operational status of service & P2P swarm");
     println!("  mbhub service install     Install MBHub daemon as system auto-start service");
     println!("  mbhub service status      Check operational status of service & P2P swarm");
@@ -2125,4 +2446,111 @@ mod tests {
         db::set_meta("terms_accepted", "true");
     }
 
+    #[test]
+    #[cfg(feature = "publisher")]
+    fn web_sync_status_indicator_updates_and_auto_hides() {
+        let _guard = lock_db();
+        let _cms_guard = crate::cms::CMS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = std::env::temp_dir().join(format!("mbhub_tui_sync_test_{}", std::process::id()));
+        let scripts = dir.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(scripts.join("sync.js"), "console.log('FAKE-SYNC-DONE');").unwrap();
+        let log = std::env::temp_dir().join(format!("mbhub_tui_sync_{}.log", std::process::id()));
+        unsafe {
+            std::env::set_var("MBHUB_CMS_DIR", &dir);
+            std::env::set_var("MBHUB_CMS_LOG", &log);
+        }
+
+        let mut app = App::for_screen(Screen::Memory);
+        app.viewer = None;
+        app.start_web_sync();
+
+        // The header indicator immediately reports the running pipeline —
+        // the screen itself is NOT taken over by a viewer.
+        assert_eq!(app.sync_status, Some(app::SyncStatus::Running));
+        assert!(app.viewer.is_none(), "sync must not open a viewer");
+
+        // The tick loop flips the indicator to Done once the pipeline exits.
+        let mut tries = 0;
+        while app.pending_sync.is_some() && tries < 200 {
+            app.tick();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            tries += 1;
+        }
+        app.tick();
+        match app.sync_status {
+            Some(app::SyncStatus::Done { success, .. }) => assert!(success),
+            other => panic!("expected Done status, got {other:?}"),
+        }
+
+        // After the TTL the indicator clears itself automatically.
+        app.sync_status = Some(app::SyncStatus::Done {
+            success: true,
+            shown_at: std::time::Instant::now() - app::SYNC_STATUS_TTL - std::time::Duration::from_millis(1),
+        });
+        app.tick();
+        assert_eq!(app.sync_status, None, "indicator must auto-hide after the TTL");
+
+        unsafe {
+            std::env::remove_var("MBHUB_CMS_DIR");
+            std::env::remove_var("MBHUB_CMS_LOG");
+        }
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(feature = "publisher")]
+    fn blog_export_pipeline_filters_swarm_and_dlp() {
+        let _guard = lock_db();
+        let _ = db::clear_all();
+
+        // 1. Clean local record -> should be candidate
+        let q1 = "How does Raft consensus elect a leader?";
+        let c1 = "In Raft, candidate nodes request votes from peers when heartbeat election timeout expires.";
+        let sim1 = simhash::compute_simhash(q1);
+        let _rec1 = db::save_inference(q1, c1, sim1, "DeepSeek", "deepseek-chat").expect("valid save");
+
+        // 2. Swarm record -> must NOT be candidate (Phase 0 privacy gate)
+        let q2 = "How to configure WireGuard VPN?";
+        let c2 = "Generate private and public keys using wg genkey and configure interface wg0.";
+        let sim2 = simhash::compute_simhash(q2);
+        let hash2 = content_hash::compute_content_hash(q2, c2, "SwarmPeer", "model");
+        let _rec2 = db::save_swarm_inference(q2, c2, sim2, "SwarmPeer", "model", &hash2).expect("valid save");
+
+        // 3. Local record containing sensitive API key -> should be candidate in DB, but blocked by second-pass DLP in export
+        let q3 = "What is my API key?";
+        let c3 = "Here is the key: sk-abcdefghijklmnopqrstuvwxyz1234567890.";
+        let sim3 = simhash::compute_simhash(q3);
+        let _rec3 = db::save_inference(q3, c3, sim3, "DeepSeek", "deepseek-chat").expect("valid save");
+
+        // Verify candidates from DB: only local records (rec1 and rec3), NOT swarm record (rec2)
+        let candidates = db::fetch_blog_export_candidates(0, true);
+        assert_eq!(candidates.len(), 2, "Only local records (is_swarm=0) should be candidates");
+        assert!(candidates.iter().any(|c| c.question == q1));
+        assert!(candidates.iter().any(|c| c.question == q3));
+        assert!(!candidates.iter().any(|c| c.question == q2));
+
+        // Test export command with a temporary directory
+        let temp_dir = std::env::temp_dir().join(format!("mbhub_blog_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let args = vec!["--out".to_string(), temp_dir.to_string_lossy().to_string(), "--all".to_string()];
+
+        let res = handle_cli_export_blog(&args);
+        assert!(res.is_ok());
+
+        // Verify exported files:
+        // rec1 must be exported
+        // rec3 must be skipped due to DLP
+        let entries: Vec<_> = std::fs::read_dir(&temp_dir).unwrap().filter_map(|e| e.ok()).collect();
+        assert_eq!(entries.len(), 1, "Only rec1 should be exported; rec3 blocked by DLP");
+
+        let file_content = std::fs::read_to_string(entries[0].path()).unwrap();
+        assert!(file_content.contains(q1));
+        assert!(file_content.contains("source: \"L3\""));
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = db::clear_all();
+    }
 }

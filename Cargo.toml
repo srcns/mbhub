@@ -1,6 +1,6 @@
 [package]
 name = "mbhub"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 description = "Sovereign, serverless P2P collective memory network for atomic AI answers"
 license = "MIT"
@@ -9,13 +9,14 @@ license = "MIT"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 crossterm = "0.28"
 crossbeam-channel = "0.5"
-libp2p = { version = "0.56", default-features = false, features = ["tcp", "noise", "yamux", "gossipsub", "tokio", "macros"] }
+libp2p = { version = "0.56", default-features = false, features = ["tcp", "noise", "yamux", "gossipsub", "tokio", "macros", "kad", "identify", "autonat", "dcutr", "relay", "websocket", "dns", "upnp", "mdns"] }
+libp2p-mdns = { version = "0.48", default-features = false, features = ["tokio"] }
 libp2p-swarm-derive = "0.35"
 ratatui = "0.29"
 rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "signal"] }
 tui-textarea = "0.7.0"
 unicode-width = "=0.2.0"
 ureq = { version = "2.10", features = ["json", "tls"] }
@@ -26,6 +27,12 @@ tar = "0.4"
 zip = { version = "4", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 
+# Distribution builds (CI, release binaries, public downloads) compile with NO
+# features: they contain only the peer-to-peer memory layer. The `publisher`
+# profile is used exclusively by the project maintainer for the private web
+# archive pipeline and is never distributed.
+[features]
+default = []
 
 # v1.0 release binaries: small, fast, stripped.
 [profile.release]
@@ -33,3 +40,8 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# The maintainer-only `publisher` cfg exists in the shared source but its
+# feature/flag is intentionally not declared in this public tree.
+[lints.rust]
+unexpected_cfgs = { level = "allow" }

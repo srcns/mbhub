@@ -3,7 +3,7 @@
 //! Streams tokens in real-time using HTTP Server-Sent Events (SSE) over ureq,
 //! without requiring heavy async HTTP runtimes.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::thread;
 use std::time::Duration;
 
@@ -18,6 +18,54 @@ pub enum StreamMessage {
     Token(String),
     Done { full_text: String, is_truncated: bool },
     Error(String),
+}
+
+/// Hard ceiling for streamed provider output (audit O13): the answer text and
+/// the reasoning scratchpad share this combined budget, so a misbehaving or
+/// hostile endpoint cannot exhaust memory by ignoring `max_tokens` and
+/// streaming forever.
+pub const MAX_STREAM_OUTPUT_BYTES: usize = 1_048_576;
+
+/// Hard ceiling for a single SSE line. Real provider events are a few hundred
+/// bytes; anything near this size means the endpoint is broken or hostile and
+/// the line must be cut off before it is buffered in full.
+const MAX_SSE_LINE_BYTES: usize = MAX_STREAM_OUTPUT_BYTES;
+
+/// Appends `next` to `current` while enforcing the cumulative stream output
+/// ceiling ([`MAX_STREAM_OUTPUT_BYTES`]).
+///
+/// `total_len` is the number of bytes accumulated across ALL output buffers
+/// (they share one budget) and `*truncated` is likewise shared: once set, all
+/// further appends are refused.
+///
+/// Returns `true` when the full chunk fit. Returns `false` when the ceiling
+/// was reached: only the UTF-8-safe prefix that still fits is appended,
+/// `*truncated` is set, and the caller must stop consuming the stream.
+fn enforce_output_cap(
+    current: &mut String,
+    next: &str,
+    total_len: &mut usize,
+    truncated: &mut bool,
+) -> bool {
+    if *truncated {
+        return false;
+    }
+    let remaining = MAX_STREAM_OUTPUT_BYTES.saturating_sub(*total_len);
+    if next.len() <= remaining {
+        current.push_str(next);
+        *total_len += next.len();
+        return true;
+    }
+    // Keep only what fits, cut on a UTF-8 character boundary so the
+    // accumulator always stays a valid String.
+    let mut take = remaining;
+    while take > 0 && !next.is_char_boundary(take) {
+        take -= 1;
+    }
+    current.push_str(&next[..take]);
+    *total_len = MAX_STREAM_OUTPUT_BYTES;
+    *truncated = true;
+    false
 }
 
 /// Spawns a background worker to stream tokens from the selected AI provider.
@@ -134,20 +182,47 @@ fn run_stream(
         }
     };
 
-    let reader = BufReader::new(res.into_reader());
+    let mut reader = BufReader::new(res.into_reader());
     let mut full_text = String::new();
     let mut reasoning_text = String::new();
+    // Shared output budget (audit O13): the answer and the reasoning
+    // scratchpad draw from ONE ceiling so a hostile endpoint cannot inflate
+    // total memory by switching between the two fields.
+    let mut output_len = 0usize;
+    let mut output_capped = false;
     let mut finish_reason: Option<String> = None;
     let mut read_error: Option<String> = None;
+    // Reusable line buffer: `read_until` appends, cleared every iteration.
+    let mut raw_line: Vec<u8> = Vec::with_capacity(8 * 1024);
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(e) => {
-                read_error = Some(e.to_string());
-                break;
+    // Manual SSE read loop instead of `reader.lines()`: every line is size
+    // checked BEFORE it is buffered, so a single gigantic line from a broken
+    // or hostile endpoint cannot balloon memory.
+    loop {
+        raw_line.clear();
+        let n = {
+            // `take` bounds how much of the line can be pulled into memory at
+            // all; `read_line`/`lines()` would grow the buffer without limit.
+            let mut limited = (&mut reader).take(MAX_SSE_LINE_BYTES as u64 + 1);
+            match limited.read_until(b'\n', &mut raw_line) {
+                Ok(0) => break, // EOF: stream finished cleanly
+                Ok(n) => n,
+                Err(e) => {
+                    read_error = Some(e.to_string());
+                    break;
+                }
             }
         };
+        if n as usize > MAX_SSE_LINE_BYTES {
+            read_error = Some(format!(
+                "SSE line exceeded the {}-byte safety ceiling",
+                MAX_SSE_LINE_BYTES
+            ));
+            break;
+        }
+        // Invalid UTF-8 degrades to replacement characters (the JSON parsing
+        // below ignores such lines) instead of aborting the whole stream.
+        let line = String::from_utf8_lossy(&raw_line);
 
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with(':') {
@@ -170,8 +245,17 @@ fn run_stream(
                                 .and_then(|d| d.get("text"))
                                 .and_then(|t| t.as_str())
                             {
-                                full_text.push_str(text);
-                                let _ = tx.send(StreamMessage::Token(text.to_string()));
+                                // Output cap (audit O13): tokens past the
+                                // ceiling are dropped, the caller stops
+                                // reading after this line.
+                                if enforce_output_cap(
+                                    &mut full_text,
+                                    text,
+                                    &mut output_len,
+                                    &mut output_capped,
+                                ) {
+                                    let _ = tx.send(StreamMessage::Token(text.to_string()));
+                                }
                             }
                         } else if event_type == "message_delta" {
                             if let Some(stop_reason) = val
@@ -200,8 +284,16 @@ fn run_stream(
                         // 1. Direct answer content
                         if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
                             if !content.is_empty() {
-                                full_text.push_str(content);
-                                let _ = tx.send(StreamMessage::Token(content.to_string()));
+                                // Output cap (audit O13): see the Anthropic
+                                // branch above.
+                                if enforce_output_cap(
+                                    &mut full_text,
+                                    content,
+                                    &mut output_len,
+                                    &mut output_capped,
+                                ) {
+                                    let _ = tx.send(StreamMessage::Token(content.to_string()));
+                                }
                             }
                         }
                         // 2. Reasoning scratchpad (only capture as fallback, do NOT mix with answer)
@@ -211,12 +303,23 @@ fn run_stream(
                             .and_then(|r| r.as_str())
                         {
                             if !reasoning.is_empty() {
-                                reasoning_text.push_str(reasoning);
+                                enforce_output_cap(
+                                    &mut reasoning_text,
+                                    reasoning,
+                                    &mut output_len,
+                                    &mut output_capped,
+                                );
                             }
                         }
                     }
                 }
             }
+        }
+
+        // Producer-side cap enforcement (audit O13): once the ceiling is hit,
+        // stop reading — and therefore stop producing tokens — entirely.
+        if output_capped {
+            break;
         }
     }
 
@@ -244,10 +347,18 @@ fn run_stream(
             is_truncated = true;
         }
     }
+    if output_capped {
+        is_truncated = true;
+    }
 
     if let Some(err) = read_error {
         is_truncated = true;
         answer.push_str(&format!("\n\n[⚠️ RESPONSE INCOMPLETE: Connection lost ({err})]"));
+    } else if output_capped {
+        // Audit O13: the truncation detector in p2p/protocol.rs refuses
+        // content containing this marker, so capped output is rendered to the
+        // LOCAL user only and can never be broadcast to P2P peers.
+        answer.push_str("\n\n[⚠️ RESPONSE INCOMPLETE: Output limit reached]");
     } else if is_truncated {
         answer.push_str("\n\n[⚠️ RESPONSE INCOMPLETE: Model token limit reached]");
     }
@@ -256,4 +367,117 @@ fn run_stream(
         full_text: answer,
         is_truncated,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ASCII filler of exactly `n` bytes.
+    fn chunk(n: usize) -> String {
+        "a".repeat(n)
+    }
+
+    #[test]
+    fn output_cap_passes_normal_chunks_through() {
+        let mut text = String::new();
+        let mut total = 0usize;
+        let mut truncated = false;
+
+        assert!(enforce_output_cap(&mut text, "Hello ", &mut total, &mut truncated));
+        assert!(enforce_output_cap(&mut text, "world", &mut total, &mut truncated));
+        assert_eq!(text, "Hello world");
+        assert_eq!(total, 11);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn output_cap_cuts_accumulation_at_ceiling() {
+        // Pre-fill the budget to three bytes below the ceiling.
+        let mut text = chunk(MAX_STREAM_OUTPUT_BYTES - 3);
+        let mut total = text.len();
+        let mut truncated = false;
+
+        // A chunk larger than the remaining budget: only the fitting prefix
+        // is kept and the caller is told to stop consuming.
+        let big = chunk(64);
+        assert!(!enforce_output_cap(&mut text, &big, &mut total, &mut truncated));
+        assert_eq!(text.len(), MAX_STREAM_OUTPUT_BYTES);
+        assert_eq!(total, MAX_STREAM_OUTPUT_BYTES);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn output_cap_is_shared_between_answer_and_reasoning() {
+        // Audit O13: the two accumulators draw from ONE budget, so filling
+        // the reasoning scratchpad must consume the answer's headroom.
+        let mut full_text = String::new();
+        let mut reasoning_text = String::new();
+        let mut total = 0usize;
+        let mut truncated = false;
+
+        let first = MAX_STREAM_OUTPUT_BYTES / 2 + 100;
+        assert!(enforce_output_cap(
+            &mut full_text,
+            &chunk(first),
+            &mut total,
+            &mut truncated
+        ));
+        assert!(!truncated);
+
+        let remaining = MAX_STREAM_OUTPUT_BYTES - first;
+        assert!(!enforce_output_cap(
+            &mut reasoning_text,
+            &chunk(remaining + 1),
+            &mut total,
+            &mut truncated
+        ));
+        assert_eq!(reasoning_text.len(), remaining);
+        assert_eq!(total, MAX_STREAM_OUTPUT_BYTES);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn output_cap_keeps_utf8_valid_when_cut_mid_character() {
+        let mut text = String::new();
+        let mut total = MAX_STREAM_OUTPUT_BYTES - 3;
+        let mut truncated = false;
+
+        // 'ä' is 2 bytes: a naive 3-byte cut would land inside a character.
+        let multibyte = "äää".to_string();
+        assert!(!enforce_output_cap(&mut text, &multibyte, &mut total, &mut truncated));
+        assert!(text.is_char_boundary(text.len()));
+        assert_eq!(text, "ä");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn output_cap_refuses_appends_after_truncation() {
+        let mut text = String::new();
+        let mut total = MAX_STREAM_OUTPUT_BYTES;
+        let mut truncated = true; // already flagged
+
+        assert!(!enforce_output_cap(&mut text, "more", &mut total, &mut truncated));
+        assert!(text.is_empty());
+        assert_eq!(total, MAX_STREAM_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn output_cap_flags_truncation_only_when_exceeded() {
+        let mut text = String::new();
+        let mut total = 0usize;
+        let mut truncated = false;
+
+        // Filling the budget exactly is still a clean (non-truncated) append.
+        assert!(enforce_output_cap(
+            &mut text,
+            &chunk(MAX_STREAM_OUTPUT_BYTES),
+            &mut total,
+            &mut truncated
+        ));
+        assert!(!truncated);
+        // The next byte trips it.
+        assert!(!enforce_output_cap(&mut text, "x", &mut total, &mut truncated));
+        assert!(truncated);
+    }
 }

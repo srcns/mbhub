@@ -1,5 +1,8 @@
+pub mod behaviour;
+pub mod bootstrap;
 pub mod identity;
 pub mod protocol;
+pub mod server;
 pub mod service;
 
 #[allow(unused_imports)]

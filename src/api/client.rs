@@ -80,6 +80,9 @@ pub fn fetch_models(endpoint: &str, api_key: Option<&str>) -> Result<Vec<String>
         .call()
         .map_err(|e| format!("HTTP request failed: {e}"))?;
 
+    // Audit O13: `into_string()` is hard-capped by ureq itself (10 MiB,
+    // `INTO_STRING_LIMIT`) — an oversized body errors out instead of
+    // exhausting memory, so no additional ceiling is needed here.
     let body: String = res
         .into_string()
         .map_err(|e| format!("Failed to read response body: {e}"))?;
@@ -263,6 +266,7 @@ Reply with a single word: YES (unsafe) or NO (safe).";
             .send_json(payload)
     };
 
+    // Bounded by ureq's built-in 10 MiB `into_string` ceiling (audit O13).
     let body = res
         .map_err(|e| format!("classification request failed: {e}"))?
         .into_string()

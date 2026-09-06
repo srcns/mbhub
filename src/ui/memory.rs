@@ -25,6 +25,9 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
             .split(area);
 
+    #[cfg(feature = "publisher")]
+    let shortcut_hint = "   ·   p: publish   s: sync web   d: delete";
+    #[cfg(not(feature = "publisher"))]
     let shortcut_hint = "   ·   d: delete";
 
     let indicator = Paragraph::new(Line::from(vec![
@@ -124,7 +127,18 @@ fn row_item(
     let clean_preview = crate::sanitize::strip_control_chars(r.preview());
     let question = fit(&clean_preview, content_w.saturating_sub(6));
 
-    let web_badge = Span::raw("      ");
+    let web_badge = if r.publish_candidate {
+        #[cfg(feature = "publisher")]
+        {
+            Span::styled("[WEB] ", ratatui::style::Style::default().fg(ratatui::style::Color::Green))
+        }
+        #[cfg(not(feature = "publisher"))]
+        {
+            Span::raw("      ")
+        }
+    } else {
+        Span::raw("      ")
+    };
 
     if is_blind {
         ListItem::new(Line::from(vec![

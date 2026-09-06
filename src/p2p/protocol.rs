@@ -100,6 +100,12 @@ impl SwarmInferenceMessage {
 /// Cryptographic Unidirectional Negative Signal (Tombstone) wire format.
 /// Broadcast over P2P GossipSub to permanently mark poisoned, deleted,
 /// or hallucinated content hashes so peers never cache or serve them.
+///
+/// Security: every tombstone MUST carry an Ed25519 `signature` made by the
+/// reporter over [`SwarmTombstoneMessage::signing_payload`]; receivers drop
+/// unsigned, mis-signed, or mis-attributed tombstones at the swarm edge.
+/// Without this, any peer could censor the swarm by deleting arbitrary
+/// content hashes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SwarmTombstoneMessage {
     pub content_hash: String,
@@ -112,11 +118,36 @@ pub struct SwarmTombstoneMessage {
 }
 
 impl SwarmTombstoneMessage {
+    /// Canonical byte payload covered by the reporter's Ed25519 signature:
+    /// `content_hash || simhash(BE u64) || timestamp(BE i64) || reason`.
+    pub fn signing_payload(&self) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(self.content_hash.len() + 20 + self.reason.len());
+        payload.extend_from_slice(self.content_hash.as_bytes());
+        payload.extend_from_slice(&self.simhash.to_be_bytes());
+        payload.extend_from_slice(&self.timestamp.to_be_bytes());
+        payload.extend_from_slice(self.reason.as_bytes());
+        payload
+    }
+
     pub fn passes_integrity_checks(&self, now_epoch: i64) -> bool {
-        if self.content_hash.is_empty() || self.content_hash.len() > 128 {
+        // BLAKE3 hex digest: exactly 64 lowercase hex characters.
+        if self.content_hash.len() != 64
+            || !self
+                .content_hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
             return false;
         }
         if self.timestamp > now_epoch.saturating_add(MAX_TIMESTAMP_SKEW_SECS) {
+            return false;
+        }
+        // Ed25519 signatures are 64 bytes.
+        if self.signature.len() != 64 {
+            return false;
+        }
+        // Reason is bounded to keep the wire payload and DB rows sane.
+        if self.reason.len() > 256 {
             return false;
         }
         true
@@ -404,18 +435,65 @@ mod tests {
 
     #[test]
     fn tombstone_message_serialization_and_integrity() {
-        let t = SwarmTombstoneMessage {
-            content_hash: "blake3_hash_1234".to_string(),
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let reporter = libp2p::identity::PeerId::from(keypair.public()).to_string();
+        let mut t = SwarmTombstoneMessage {
+            content_hash: "a".repeat(64),
             simhash: 0x12345678,
             timestamp: 1_770_000_000,
-            reporter_peer_id: "peer_123".to_string(),
+            reporter_peer_id: reporter,
             reason: "User flagged hallucination".to_string(),
-            signature: vec![1, 2, 3],
+            signature: Vec::new(),
         };
+        t.signature = keypair.sign(&t.signing_payload()).expect("ed25519 sign");
         assert!(t.passes_integrity_checks(1_770_000_000));
         let bytes = serde_json::to_vec(&t).unwrap();
         let parsed: SwarmTombstoneMessage = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed.content_hash, t.content_hash);
         assert_eq!(parsed.reason, t.reason);
+        // Signature round-trips and still verifies.
+        assert_eq!(parsed.signature, t.signature);
+        assert!(
+            keypair
+                .public()
+                .verify(&parsed.signing_payload(), &parsed.signature),
+            "signature must verify after wire round-trip"
+        );
+    }
+
+    #[test]
+    fn tombstone_rejects_unsigned_malformed_or_tampered() {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let mut t = SwarmTombstoneMessage {
+            content_hash: "a".repeat(64),
+            simhash: 0x12345678,
+            timestamp: 1_770_000_000,
+            reporter_peer_id: libp2p::identity::PeerId::from(keypair.public()).to_string(),
+            reason: "x".to_string(),
+            signature: Vec::new(),
+        };
+
+        // Unsigned (the pre-fix wire format) must be rejected outright.
+        assert!(!t.passes_integrity_checks(1_770_000_000));
+
+        // Signature of the wrong length rejected.
+        t.signature = vec![1; 63];
+        assert!(!t.passes_integrity_checks(1_770_000_000));
+
+        // Non-hex / wrong-length content hash rejected.
+        t.signature = keypair.sign(&t.signing_payload()).unwrap();
+        t.content_hash = "blake3_hash_1234".to_string();
+        t.signature = keypair.sign(&t.signing_payload()).unwrap();
+        assert!(!t.passes_integrity_checks(1_770_000_000));
+
+        // Well-formed hash + signature passes.
+        t.content_hash = "b".repeat(64);
+        t.signature = keypair.sign(&t.signing_payload()).unwrap();
+        assert!(t.passes_integrity_checks(1_770_000_000));
+
+        // Tampered reason invalidates the signature.
+        t.reason = "tampered".to_string();
+        let pk = keypair.public();
+        assert!(!pk.verify(&t.signing_payload(), &t.signature));
     }
 }

@@ -47,6 +47,8 @@ pub enum SettingsField {
     // Maintenance & Legal
     BackupDatabase,
     RestoreDatabase,
+    #[cfg_attr(not(feature = "publisher"), allow(dead_code))]
+    SyncWebArchive,
     ClearCache,
     TermsOfService,
 }
@@ -244,13 +246,30 @@ pub struct PendingSwarmQuery {
     pub request_id: String,
     pub question: String,
     pub simhash: u64,
-    /// Deadline reference for the 600 ms swarm wait — set when the query is
+    /// Deadline reference for the 2.5 s swarm wait — set when the query is
     /// actually broadcast (after the privacy jitter).
     pub started_at: std::time::Instant,
     /// Jittered moment when the query should leave the node. `None` means the
     /// query was already broadcast (or is test-injected as already sent).
     pub broadcast_at: Option<std::time::Instant>,
 }
+
+/// Transient header-bar state for the web-archive synchronization pipeline
+/// (publisher builds only). The completion state auto-clears after
+/// `SYNC_STATUS_TTL` so the normal flow is never disrupted.
+#[cfg(feature = "publisher")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncStatus {
+    Running,
+    Done {
+        success: bool,
+        shown_at: std::time::Instant,
+    },
+}
+
+/// How long the "sync completed / failed" header indicator stays visible.
+#[cfg(feature = "publisher")]
+pub const SYNC_STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// An outbound inference awaiting its stage-2 safety classification verdict.
 /// Fail-closed: no verdict (error/timeout/disconnect) → never published.
@@ -312,6 +331,12 @@ pub struct App {
     pub pending_query: Option<PendingSwarmQuery>,
     /// Real-time streaming AI inference task.
     pub active_stream: Option<ActiveStream>,
+    /// Receiver for the running web-archive sync (publisher builds only).
+    #[cfg(feature = "publisher")]
+    pub pending_sync: Option<crossbeam_channel::Receiver<crate::cms::SyncOutcome>>,
+    /// Transient web-archive sync indicator shown in the header bar.
+    #[cfg(feature = "publisher")]
+    pub sync_status: Option<SyncStatus>,
     /// Outbound inferences awaiting stage-2 safety classification (fail-closed).
     pub pending_safety_checks: Vec<PendingSafetyCheck>,
     /// Hourly budget bookkeeping for stage-2 classifications.
@@ -390,6 +415,10 @@ impl App {
             p2p,
             pending_query: None,
             active_stream: None,
+            #[cfg(feature = "publisher")]
+            pending_sync: None,
+            #[cfg(feature = "publisher")]
+            sync_status: None,
             pending_safety_checks: Vec::new(),
             safety_budget_used: 0,
             safety_budget_window: Instant::now(),
@@ -504,6 +533,10 @@ impl App {
         fields.push(SettingsField::ApiKey);
         fields.push(SettingsField::BackupDatabase);
         fields.push(SettingsField::RestoreDatabase);
+        #[cfg(feature = "publisher")]
+        if crate::cms::cms_dir().is_some() || std::env::var("MBHUB_PUBLISHER").is_ok() {
+            fields.push(SettingsField::SyncWebArchive);
+        }
         fields.push(SettingsField::ClearCache);
         fields.push(SettingsField::TermsOfService);
         fields
@@ -925,6 +958,30 @@ impl App {
     /// Periodic tick called by the event loop to process streaming tokens,
     /// pending P2P swarm queries, and incoming gossip messages without blocking.
     pub fn tick(&mut self) {
+        // 0. Web-archive sync bookkeeping (publisher builds): when the
+        // background pipeline finishes, switch the header indicator to the
+        // completion state and auto-clear it after the TTL. The normal flow
+        // (Memory/Ask/Settings) is never taken over.
+        #[cfg(feature = "publisher")]
+        {
+            let done = self
+                .pending_sync
+                .as_ref()
+                .and_then(|rx| rx.try_recv().ok());
+            if let Some(outcome) = done {
+                self.pending_sync = None;
+                self.sync_status = Some(SyncStatus::Done {
+                    success: outcome.success,
+                    shown_at: std::time::Instant::now(),
+                });
+            }
+            if let Some(SyncStatus::Done { shown_at, .. }) = self.sync_status {
+                if shown_at.elapsed() >= SYNC_STATUS_TTL {
+                    self.sync_status = None;
+                }
+            }
+        }
+
         // 1. Drain pending stage-2 safety classifications (fail-closed).
         self.drain_safety_checks();
 
@@ -1008,8 +1065,9 @@ impl App {
             }
 
             if !resolved {
-                // If query deadline expired (600ms), fallback to AI Provider
-                if pending.started_at.elapsed() > std::time::Duration::from_millis(600) {
+                // If query deadline expired (2.5s — gossipsub mesh settles a
+                // heartbeat or two after connecting), fallback to AI Provider
+                if pending.started_at.elapsed() > std::time::Duration::from_millis(2_500) {
                     self.dispatch_ai_inference(&pending.question, pending.simhash);
                 } else {
                     self.pending_query = Some(pending);
@@ -1490,6 +1548,10 @@ impl App {
                                 signature: Vec::new(),
                             });
                         }
+                        // Two-way deletion: publisher builds also prune the
+                        // web archive (maintainer-only, never distributed).
+                        #[cfg(feature = "publisher")]
+                        trigger_cms_sync_background();
                         self.reload_records();
                         if self.total_records > 0 && self.memory_selected >= self.total_records {
                             self.memory_selected = self.total_records - 1;
@@ -1498,6 +1560,21 @@ impl App {
                         self.ensure_window();
                     }
                 }
+            }
+            #[cfg(feature = "publisher")]
+            KeyCode::Char('p') => {
+                if self.total_records > 0 && self.memory_selected < self.total_records {
+                    if let Some(record) = self.get_memory_record(self.memory_selected) {
+                        let _ = crate::db::toggle_publish_candidate(&record.content_hash, &record.question);
+                        self.reload_records();
+                        self.scroll_into_view();
+                        self.ensure_window();
+                    }
+                }
+            }
+            #[cfg(feature = "publisher")]
+            KeyCode::Char('s') => {
+                self.start_web_sync();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.memory_selected > 0 {
@@ -1663,6 +1740,7 @@ impl App {
             | SettingsField::ApiKey
             | SettingsField::BackupDatabase
             | SettingsField::RestoreDatabase
+            | SettingsField::SyncWebArchive
             | SettingsField::ClearCache
             | SettingsField::TermsOfService => {}
         }
@@ -1770,6 +1848,10 @@ impl App {
                     FileBrowserMode::SelectFile,
                 ));
             }
+            #[cfg(feature = "publisher")]
+            SettingsField::SyncWebArchive => {
+                self.start_web_sync();
+            }
             SettingsField::ClearCache => {
                 self.confirm_modal = Some(ConfirmModal {
                     title: "Clear local storage?".to_string(),
@@ -1783,6 +1865,9 @@ impl App {
                     crate::tos::CURRENT_TOS_VERSION,
                 ));
             }
+    // Variants hidden from non-publisher builds resolve to no-op.
+    #[cfg(not(feature = "publisher"))]
+    _ => {}
         }
     }
 
@@ -1877,6 +1962,24 @@ impl App {
         }
         self.editing = false;
     }
+
+    /// Maintainer-only: starts the web archive pipeline in the background.
+    /// The header bar shows a transient "syncing" indicator that flips to
+    /// "completed / failed" when the run finishes and auto-clears after a few
+    /// seconds — the current screen and selection stay exactly as they are.
+    #[cfg(feature = "publisher")]
+    pub fn start_web_sync(&mut self) {
+        if self.pending_sync.is_some() {
+            return; // already running — do not stack duplicate pipelines
+        }
+        let (tx, rx) = crossbeam_channel::unbounded();
+        thread::spawn(move || {
+            let outcome = crate::cms::run_sync();
+            let _ = tx.send(outcome);
+        });
+        self.pending_sync = Some(rx);
+        self.sync_status = Some(SyncStatus::Running);
+    }
 }
 
 impl Default for App {
@@ -1904,4 +2007,13 @@ fn query_jitter() -> Duration {
         .map(|d| d.subsec_nanos() as u64)
         .unwrap_or(0);
     Duration::from_millis(50 + nanos % 251)
+}
+
+/// Maintainer-only: triggers headless synchronization with the web archive
+/// repository in the background. Compiled exclusively into `publisher` builds.
+#[cfg(feature = "publisher")]
+pub fn trigger_cms_sync_background() {
+    thread::spawn(|| {
+        crate::cms::trigger_sync();
+    });
 }

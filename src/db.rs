@@ -38,18 +38,62 @@ pub fn db_path() -> String {
         }
         if let Some(home) = std::env::var("HOME").ok().or_else(|| std::env::var("USERPROFILE").ok()) {
             let dir = std::path::PathBuf::from(home).join(".mbhub");
-            let _ = std::fs::create_dir_all(&dir);
+            ensure_private_dir(&dir);
             return dir.join("mbhub.db").to_string_lossy().to_string();
         }
         "mbhub.db".to_string()
     }
 }
 
+/// Creates `dir` (including parents) if missing and locks it to owner-only
+/// access (0700) on Unix. The data directory holds the SQLite store — whose
+/// `meta` table keeps provider API keys in plaintext — so a group/world
+/// traversable directory would expose them to every local user.
+/// Best-effort: permission failures never prevent the store from being used.
+fn ensure_private_dir(dir: &std::path::Path) {
+    let _ = std::fs::create_dir_all(dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(dir) {
+            if meta.is_dir() && meta.permissions().mode() & 0o777 != 0o700 {
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+}
+
 fn open() -> Connection {
-    let conn = Connection::open(db_path()).expect("failed to open the MBHub sqlite database");
+    let path = db_path();
+    let conn = Connection::open(&path).expect("failed to open the MBHub sqlite database");
+    enforce_owner_only_db_files(&path);
     let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
     conn
 }
+
+/// Restricts the SQLite file (and its WAL/SHM siblings) to owner-only access
+/// (0600) on Unix. The `meta` table stores provider API keys in plaintext, so
+/// a database created with a permissive umask (0644) would leak them to every
+/// local user. Best-effort: never blocks opening the store.
+#[cfg(unix)]
+fn enforce_owner_only_db_files(db_file: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let lock_down = |path: std::path::PathBuf| {
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if !meta.is_dir() && meta.permissions().mode() & 0o777 != 0o600 {
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    };
+    lock_down(std::path::PathBuf::from(db_file));
+    // WAL and SHM side files hold recently written pages (which may include
+    // `apikey:` rows) and must be equally protected.
+    lock_down(std::path::PathBuf::from(format!("{db_file}-wal")));
+    lock_down(std::path::PathBuf::from(format!("{db_file}-shm")));
+}
+
+#[cfg(not(unix))]
+fn enforce_owner_only_db_files(_db_file: &str) {}
 
 fn init(conn: &Connection) {
     conn.execute_batch(
@@ -603,10 +647,26 @@ pub fn is_tombstoned(content_hash: &str) -> bool {
     count > 0
 }
 
+/// Hard cap on tombstone rows. The `tombstones` table is fed by swarm input
+/// (content hashes arrive from remote peers), so without a bound any peer
+/// could grow it without limit — a disk-fill DoS. The oldest entries are
+/// pruned once the cap is exceeded.
+const MAX_TOMBSTONES: usize = 10_000;
+
 /// Records a tombstone for a content hash and simhash, permanently preventing
 /// it from being cached or served, and deletes any matching inference from SQLite.
+///
+/// Only well-formed BLAKE3 content hashes (exactly 64 lowercase hex
+/// characters, as produced by `content_hash::compute_content_hash`) are
+/// accepted; anything else is ignored so malformed swarm input can neither
+/// poison the negative-signal table nor grow it.
 pub fn add_tombstone(content_hash: &str, simhash: u64, reason: &str) {
-    if content_hash.is_empty() {
+    add_tombstone_capped(content_hash, simhash, reason, MAX_TOMBSTONES);
+}
+
+/// Internal variant with an injectable row cap (used directly by tests).
+fn add_tombstone_capped(content_hash: &str, simhash: u64, reason: &str, max_rows: usize) {
+    if !is_valid_content_hash(content_hash) {
         return;
     }
     let conn = open();
@@ -620,6 +680,33 @@ pub fn add_tombstone(content_hash: &str, simhash: u64, reason: &str) {
         "DELETE FROM inferences WHERE content_hash = ?1",
         params![content_hash],
     );
+    prune_tombstones(&conn, max_rows);
+}
+
+/// Keeps the newest `max_rows` tombstones, pruning the oldest beyond the cap.
+fn prune_tombstones(conn: &Connection, max_rows: usize) {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tombstones", [], |r| r.get(0))
+        .unwrap_or(0);
+    if count <= max_rows as i64 {
+        return;
+    }
+    let excess = count - max_rows as i64;
+    let _ = conn.execute(
+        "DELETE FROM tombstones WHERE content_hash IN (
+             SELECT content_hash FROM tombstones ORDER BY timestamp ASC, rowid ASC LIMIT ?1
+         )",
+        params![excess],
+    );
+}
+
+/// True when `hash` is a well-formed BLAKE3 content hash: exactly 64
+/// lowercase hex characters, as produced by `content_hash::compute_content_hash`.
+fn is_valid_content_hash(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Deletes a record from local storage and adds a tombstone.
@@ -1293,7 +1380,14 @@ pub fn reseed() -> usize {
 }
 
 /// Exports a complete snapshot of the current database to `dest_path`.
+///
+/// The snapshot contains plaintext API keys from the `meta` table, so on Unix
+/// the destination is pre-created with owner-only (0600) permissions (no
+/// world-readable window while the copy runs) and a pre-existing destination
+/// file's mode is repaired to 0600 afterwards.
 pub fn backup_to_file(dest_path: &std::path::Path) -> Result<(), rusqlite::Error> {
+    #[cfg(unix)]
+    precreate_owner_only(dest_path);
     let src = open();
     init(&src);
     let mut dst = Connection::open(dest_path)?;
@@ -1301,7 +1395,133 @@ pub fn backup_to_file(dest_path: &std::path::Path) -> Result<(), rusqlite::Error
         let backup = rusqlite::backup::Backup::new(&src, &mut dst)?;
         backup.run_to_completion(100, std::time::Duration::from_millis(10), None)?;
     }
+    #[cfg(unix)]
+    set_owner_only(dest_path);
     Ok(())
+}
+
+/// Creates an empty file at `path` with 0600 permissions on Unix unless it
+/// already exists (in which case SQLite reuses it as-is).
+#[cfg(unix)]
+fn precreate_owner_only(path: &std::path::Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path);
+}
+
+/// Force-sets 0600 on `path` (best-effort, Unix).
+#[cfg(unix)]
+fn set_owner_only(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+/// Post-restore hardening: a restored database is untrusted input, so every
+/// inference row is re-sanitized through `strip_control_chars` and its BLAKE3
+/// content hash re-verified against the sanitized fields. Records with an
+/// empty or malformed hash, or a hash that does not derive from their
+/// (sanitized) content, are dropped instead of served — the same integrity
+/// contract the live write path enforces.
+fn sanitize_restored_rows(conn: &Connection) {
+    enum RowAction {
+        Drop(i64),
+        Resanitize(i64),
+    }
+
+    let tx = match conn.unchecked_transaction() {
+        Ok(tx) => tx,
+        Err(_) => return,
+    };
+
+    let mut actions: Vec<RowAction> = Vec::new();
+    {
+        let mut stmt = match tx
+            .prepare("SELECT id, question, content, provider, model, content_hash FROM inferences")
+        {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5).unwrap_or_default(),
+            ))
+        });
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                let (id, question, content, provider, model, stored_hash) = row;
+                if !is_valid_content_hash(&stored_hash) {
+                    actions.push(RowAction::Drop(id));
+                    continue;
+                }
+                let clean_question = crate::sanitize::strip_control_chars(&question);
+                let clean_content = crate::sanitize::strip_control_chars(&content);
+                let clean_provider = crate::sanitize::strip_control_chars(&provider);
+                let clean_model = crate::sanitize::strip_control_chars(&model);
+                let recomputed = crate::content_hash::compute_content_hash(
+                    &clean_question,
+                    &clean_content,
+                    &clean_provider,
+                    &clean_model,
+                );
+                if recomputed != stored_hash {
+                    // Tampered or attacker-crafted payload.
+                    actions.push(RowAction::Drop(id));
+                } else if clean_question != question
+                    || clean_content != content
+                    || clean_provider != provider
+                    || clean_model != model
+                {
+                    actions.push(RowAction::Resanitize(id));
+                }
+            }
+        }
+    }
+
+    for action in actions {
+        match action {
+            RowAction::Drop(id) => {
+                let _ = tx.execute("DELETE FROM inferences WHERE id = ?1", params![id]);
+            }
+            RowAction::Resanitize(id) => {
+                // Re-read and rewrite the row with sanitized fields.
+                let fields = tx
+                    .query_row(
+                        "SELECT question, content, provider, model FROM inferences WHERE id = ?1",
+                        params![id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        },
+                    )
+                    .ok();
+                if let Some((question, content, provider, model)) = fields {
+                    let _ = tx.execute(
+                        "UPDATE inferences SET question = ?1, content = ?2, provider = ?3, model = ?4 WHERE id = ?5",
+                        params![
+                            crate::sanitize::strip_control_chars(&question),
+                            crate::sanitize::strip_control_chars(&content),
+                            crate::sanitize::strip_control_chars(&provider),
+                            crate::sanitize::strip_control_chars(&model),
+                            id,
+                        ],
+                    );
+                }
+            }
+        }
+    }
+    let _ = tx.commit();
 }
 
 /// Restores the current database from an existing backup at `src_path`.
@@ -1316,6 +1536,10 @@ pub fn restore_from_file(src_path: &std::path::Path) -> Result<usize, rusqlite::
 
     // Ensure schema migrations & indices are complete on the restored database
     init(&dst);
+
+    // Post-restore hardening: sanitize + re-verify every restored row.
+    sanitize_restored_rows(&dst);
+
     let count: i64 = dst
         .query_row("SELECT COUNT(*) FROM inferences", [], |r| r.get(0))
         .unwrap_or(0);
@@ -1491,4 +1715,367 @@ fn pseudo(mut x: u32) -> u32 {
     x = x.wrapping_mul(0xC2B2_AE35);
     x ^= x >> 16;
     x
+}
+
+/// A candidate record for local blog export.
+/// (Maintainer-only: consumed by the `publisher` build.)
+#[derive(Clone, Debug)]
+#[cfg_attr(not(feature = "publisher"), allow(dead_code))]
+pub struct BlogExportItem {
+    pub id: i64,
+    pub timestamp: i64,
+    pub similarity: f32,
+    pub question: String,
+    pub content: String,
+    pub simhash: u64,
+    pub provider: String,
+    pub model: String,
+    pub content_hash: String,
+    pub is_swarm: bool,
+}
+
+/// Fetches questions eligible for blog publication.
+/// All records marked as publish_candidate = 1 are exported.
+/// (Maintainer-only: referenced by the `publisher` build.)
+#[cfg_attr(not(feature = "publisher"), allow(dead_code))]
+pub fn fetch_blog_export_candidates(last_id: i64, export_all: bool) -> Vec<BlogExportItem> {
+    let conn = open();
+    init(&conn);
+
+    let query = if export_all {
+        "SELECT id, timestamp, similarity, question, content, simhash, provider, model, content_hash, is_swarm
+         FROM inferences
+         WHERE publish_candidate = 1
+         ORDER BY id ASC"
+    } else {
+        "SELECT id, timestamp, similarity, question, content, simhash, provider, model, content_hash, is_swarm
+         FROM inferences
+         WHERE id > ?1 AND publish_candidate = 1
+         ORDER BY id ASC"
+    };
+
+    let mut stmt = match conn.prepare(query) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let map_fn = |r: &rusqlite::Row| {
+        Ok(BlogExportItem {
+            id: r.get(0)?,
+            timestamp: r.get(1)?,
+            similarity: r.get::<_, f64>(2)? as f32,
+            question: r.get(3)?,
+            content: r.get(4)?,
+            simhash: r.get::<_, i64>(5)? as u64,
+            provider: r.get(6)?,
+            model: r.get(7)?,
+            content_hash: r.get(8)?,
+            is_swarm: r.get::<_, i64>(9)? != 0,
+        })
+    };
+
+    let rows = if export_all {
+        stmt.query_map([], map_fn)
+    } else {
+        stmt.query_map(params![last_id], map_fn)
+    };
+
+    rows.map(|iter| iter.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Marks an inference record as published with the current epoch timestamp.
+/// (Maintainer-only: referenced by the `publisher` build.)
+#[cfg_attr(not(feature = "publisher"), allow(dead_code))]
+pub fn mark_published(id: i64, timestamp: i64) {
+    let conn = open();
+    init(&conn);
+    let _ = conn.execute(
+        "UPDATE inferences SET published_at = ?1 WHERE id = ?2",
+        params![timestamp, id],
+    );
+}
+
+/// Reads the last processed blog export inference ID from meta.
+/// (Maintainer-only: referenced by the `publisher` build.)
+#[cfg_attr(not(feature = "publisher"), allow(dead_code))]
+pub fn get_last_blog_export_id() -> i64 {
+    get_meta("last_blog_export_id")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// Updates the last processed blog export inference ID in meta.
+/// (Maintainer-only: referenced by the `publisher` build.)
+#[cfg_attr(not(feature = "publisher"), allow(dead_code))]
+pub fn set_last_blog_export_id(id: i64) {
+    set_meta("last_blog_export_id", &id.to_string());
+}
+
+/// Toggles the publish_candidate state of a record by content hash or question.
+/// Returns the new state (true = candidate, false = not candidate).
+/// (Maintainer-only: referenced by the `publisher` build.)
+#[cfg_attr(not(feature = "publisher"), allow(dead_code))]
+pub fn toggle_publish_candidate(content_hash: &str, question: &str) -> Option<bool> {
+    let conn = open();
+    init(&conn);
+
+    let current: Option<i64> = conn
+        .query_row(
+            "SELECT publish_candidate FROM inferences WHERE content_hash = ?1 OR question = ?2 LIMIT 1",
+            params![content_hash, question],
+            |r| r.get(0),
+        )
+        .ok();
+
+    if let Some(val) = current {
+        let new_val = if val == 1 { 0 } else { 1 };
+        let _ = conn.execute(
+            "UPDATE inferences SET publish_candidate = ?1 WHERE content_hash = ?2 OR question = ?3",
+            params![new_val, content_hash, question],
+        );
+        Some(new_val == 1)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static DB_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn remove_db_files(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(std::path::PathBuf::from(format!("{}-wal", path.display())));
+        let _ = std::fs::remove_file(std::path::PathBuf::from(format!("{}-shm", path.display())));
+    }
+
+    /// Redirects `MBHUB_DB` to a fresh per-test temporary database for the
+    /// duration of the test. Holds the db lock plus the shared env lock
+    /// (other test modules mutate the same environment variables); the
+    /// previous variable value is restored on drop.
+    struct TestDb {
+        path: std::path::PathBuf,
+        previous: Option<String>,
+        _guards: (
+            std::sync::MutexGuard<'static, ()>,
+            std::sync::MutexGuard<'static, ()>,
+        ),
+    }
+
+    impl TestDb {
+        fn new(name: &str) -> Self {
+            let db_guard = DB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let env_guard = crate::env::ENV_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let path = std::env::temp_dir().join(format!(
+                "mbhub_dbsec_test_{}_{}.sqlite",
+                name,
+                std::process::id()
+            ));
+            remove_db_files(&path);
+            let previous = std::env::var("MBHUB_DB").ok();
+            unsafe {
+                std::env::set_var("MBHUB_DB", &path);
+            }
+            Self {
+                path,
+                previous,
+                _guards: (db_guard, env_guard),
+            }
+        }
+    }
+
+    impl Drop for TestDb {
+        fn drop(&mut self) {
+            remove_db_files(&self.path);
+            unsafe {
+                match &self.previous {
+                    Some(p) => std::env::set_var("MBHUB_DB", p),
+                    None => std::env::remove_var("MBHUB_DB"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn content_hash_format_validation() {
+        assert!(is_valid_content_hash(&"a".repeat(64)));
+        assert!(!is_valid_content_hash(""));
+        assert!(!is_valid_content_hash(&"A".repeat(64)), "uppercase hex rejected");
+        assert!(!is_valid_content_hash(&"a".repeat(63)), "too short rejected");
+        assert!(!is_valid_content_hash(&"a".repeat(65)), "too long rejected");
+        assert!(!is_valid_content_hash(&"g".repeat(64)), "non-hex rejected");
+        assert!(!is_valid_content_hash("deadbeef"));
+        // Real hashes are always well-formed.
+        let real = crate::content_hash::compute_content_hash("q", "c", "p", "m");
+        assert!(is_valid_content_hash(&real));
+    }
+
+    #[test]
+    fn db_and_backup_files_are_owner_only() {
+        let test_db = TestDb::new("perms");
+        let _conn = open(); // creates and locks the database file
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&test_db.path), 0o600, "database file must be owner-only");
+
+            // A drifted (or pre-existing) file is repaired on the next open.
+            std::fs::set_permissions(&test_db.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let _conn2 = open();
+            assert_eq!(mode(&test_db.path), 0o600, "open() must repair drifted permissions");
+
+            // The ~/.mbhub data directory is created and kept owner-only.
+            let dir = std::env::temp_dir().join(format!("mbhub_dbsec_dir_test_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            ensure_private_dir(&dir);
+            assert_eq!(mode(&dir), 0o700, "data directory must be owner-only");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            ensure_private_dir(&dir);
+            assert_eq!(mode(&dir), 0o700, "loose directories must be repaired");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // Backup output is owner-only too (it contains plaintext API keys).
+        let dest = std::env::temp_dir().join(format!("mbhub_dbsec_backup_test_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&dest);
+        backup_to_file(&dest).expect("backup succeeds");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "backup file must be owner-only");
+
+            // A pre-existing loose backup destination gets repaired.
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644)).unwrap();
+            backup_to_file(&dest).expect("second backup succeeds");
+            let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "loose backup files must be repaired");
+        }
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn restore_sanitizes_and_rejects_unverified_rows() {
+        // Build a crafted "backup" containing clean, malicious and tampered rows.
+        let src_path =
+            std::env::temp_dir().join(format!("mbhub_dbsec_restore_src_{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&src_path);
+        {
+            let src = Connection::open(&src_path).unwrap();
+            init(&src);
+            let good_hash = crate::content_hash::compute_content_hash(
+                "What is Rust?",
+                "A systems programming language.",
+                "OpenAI",
+                "gpt-4o",
+            );
+            // Attacker-crafted hash over the RAW (unsanitized) fields: fails
+            // verification once the fields are sanitized.
+            let esc_content = "harmless start \x1b]52;c;bWFsaWNpb3Vz\x07 harmless end";
+            let attacker_hash = crate::content_hash::compute_content_hash(
+                "Escape attempt",
+                esc_content,
+                "OpenAI",
+                "gpt-4o",
+            );
+            let rewrite_hash = crate::content_hash::compute_content_hash(
+                "Rewrite me",
+                "Body with clear",
+                "OpenAI",
+                "gpt-4o",
+            );
+            for (q, c, hash) in [
+                ("What is Rust?", "A systems programming language.", good_hash.as_str()),
+                ("Escape attempt", esc_content, attacker_hash.as_str()),
+                ("Bad hash row", "Valid answer body.", "deadbeef"),
+                ("Rewrite \x1b[31mme", "Body with \x1b[2Jclear", rewrite_hash.as_str()),
+            ] {
+                src.execute(
+                    "INSERT INTO inferences (timestamp, similarity, question, content, simhash, provider, model, content_hash)
+                     VALUES (?1, ?2, ?3, ?4, 0, 'OpenAI', 'gpt-4o', ?5)",
+                    params![1_i64, 50.0_f64, q, c, hash],
+                )
+                .unwrap();
+            }
+        } // src connection dropped: WAL checkpointed before the restore reads it.
+
+        let _test_db = TestDb::new("restore");
+        let restored = restore_from_file(&src_path).expect("restore succeeds");
+        assert_eq!(restored, 2, "only integrity-verified rows survive");
+
+        let records = load_records_window(0, 100);
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| r.content_hash.len() == 64));
+        assert!(
+            !records.iter().any(|r| r.question == "Escape attempt"),
+            "row hashed over raw (unsanitized) content must be dropped"
+        );
+        assert!(
+            !records.iter().any(|r| r.question == "Bad hash row"),
+            "malformed content_hash must be dropped"
+        );
+        let rewritten = records
+            .iter()
+            .find(|r| r.question == "Rewrite me")
+            .expect("sanitizable row kept");
+        assert_eq!(
+            rewritten.content, "Body with clear",
+            "control chars must be stripped on restore"
+        );
+
+        let _ = std::fs::remove_file(&src_path);
+    }
+
+    #[test]
+    fn tombstone_rejects_malformed_hashes() {
+        let _test_db = TestDb::new("tombhex");
+        let _ = clear_tombstones();
+
+        add_tombstone("", 0, "empty");
+        add_tombstone(&"A".repeat(64), 0, "uppercase");
+        add_tombstone(&"a".repeat(63), 0, "too short");
+        add_tombstone("deadbeef", 0, "malformed");
+
+        let conn = open();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tombstones", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "malformed hashes must be rejected");
+
+        let valid = crate::content_hash::compute_content_hash("q", "c", "p", "m");
+        add_tombstone(&valid, 42, "valid");
+        assert!(is_tombstoned(&valid));
+    }
+
+    #[test]
+    fn tombstone_table_is_capped() {
+        assert_eq!(MAX_TOMBSTONES, 10_000);
+        let _test_db = TestDb::new("tombcap");
+        let _ = clear_tombstones();
+
+        for i in 0..8u64 {
+            add_tombstone_capped(&format!("{i:064x}"), 0, "flood", 5);
+        }
+
+        let conn = open();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tombstones", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 5, "cap must prune the oldest entries");
+        // Same-second inserts are pruned in insertion order: oldest first.
+        for i in 0..3u64 {
+            assert!(!is_tombstoned(&format!("{i:064x}")), "oldest entry {i} pruned");
+        }
+        for i in 3..8u64 {
+            assert!(is_tombstoned(&format!("{i:064x}")), "newest entry {i} kept");
+        }
+    }
 }

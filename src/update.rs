@@ -25,6 +25,12 @@ const WEBSITE_MANIFEST_URL: &str = "https://mbhub.dev/releases/latest.txt";
 /// Hard cap on downloaded release payloads (archives + overhead).
 const MAX_DOWNLOAD_BYTES: u64 = 100_000_000;
 
+/// Hard cap on the *decompressed* size of a single archive entry — a
+/// decompression-bomb guard. A tiny `.tar.gz`/`.zip` can expand to gigabytes,
+/// so the extracted entry is capped independently of the compressed download
+/// cap (256 MiB is far above any legitimate mbhub binary).
+const MAX_EXTRACTED_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+
 #[derive(Deserialize, Debug)]
 struct ReleaseAsset {
     name: String,
@@ -155,7 +161,19 @@ fn resolve_latest_release(user_agent: &str) -> Result<(UpdateSource, String, Str
 /// Extracts the executable bytes from a release asset payload. Raw binary
 /// assets pass through untouched; `.tar.gz` and `.zip` archives are unpacked
 /// in memory (both formats are produced by the release CI pipeline).
+///
+/// The decompressed entry size is capped (`MAX_EXTRACTED_ENTRY_BYTES`) so a
+/// malicious archive cannot exhaust memory with a decompression bomb.
 fn extract_binary(asset_name: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    extract_binary_capped(asset_name, bytes, MAX_EXTRACTED_ENTRY_BYTES)
+}
+
+/// Internal variant with an injectable entry cap (used directly by tests).
+fn extract_binary_capped(
+    asset_name: &str,
+    bytes: &[u8],
+    max_entry_bytes: u64,
+) -> Result<Vec<u8>, String> {
     if asset_name.ends_with(".tar.gz") {
         let decoder = flate2::read::GzDecoder::new(bytes);
         let mut archive = tar::Archive::new(decoder);
@@ -163,16 +181,24 @@ fn extract_binary(asset_name: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
             .entries()
             .map_err(|e| format!("invalid tar.gz archive: {e}"))?;
         for entry in entries {
-            let mut entry = entry.map_err(|e| format!("invalid tar.gz entry: {e}"))?;
+            let entry = entry.map_err(|e| format!("invalid tar.gz entry: {e}"))?;
             let path = entry
                 .path()
                 .map_err(|e| format!("invalid tar.gz entry path: {e}"))?;
             let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if fname == "mbhub" || fname == "mbhub.exe" {
+                // `take` bounds the decompressed read: the entry can never
+                // expand past the cap in memory.
                 let mut buf = Vec::new();
-                entry
+                let mut limited = entry.take(max_entry_bytes);
+                limited
                     .read_to_end(&mut buf)
                     .map_err(|e| format!("failed to read binary from archive: {e}"))?;
+                if buf.len() as u64 >= max_entry_bytes {
+                    return Err(format!(
+                        "archive entry expands to the {max_entry_bytes}-byte extraction cap — refusing possible decompression bomb"
+                    ));
+                }
                 return Ok(buf);
             }
         }
@@ -181,15 +207,21 @@ fn extract_binary(asset_name: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
         let mut archive =
             zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("invalid zip archive: {e}"))?;
         for idx in 0..archive.len() {
-            let mut entry = archive
+            let entry = archive
                 .by_index(idx)
                 .map_err(|e| format!("invalid zip entry: {e}"))?;
             let fname = entry.name().rsplit('/').next().unwrap_or("");
             if fname == "mbhub" || fname == "mbhub.exe" {
                 let mut buf = Vec::new();
-                entry
+                let mut limited = entry.take(max_entry_bytes);
+                limited
                     .read_to_end(&mut buf)
                     .map_err(|e| format!("failed to read binary from archive: {e}"))?;
+                if buf.len() as u64 >= max_entry_bytes {
+                    return Err(format!(
+                        "zip entry expands to the {max_entry_bytes}-byte extraction cap — refusing possible decompression bomb"
+                    ));
+                }
                 return Ok(buf);
             }
         }
@@ -197,6 +229,31 @@ fn extract_binary(asset_name: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
     } else {
         Ok(bytes.to_vec())
     }
+}
+
+/// Verifies the downloaded asset against the release's SHA256SUMS.txt.
+///
+/// Verification is mandatory: a release that does not publish a checksum
+/// manifest (`sums_url == None`) is rejected outright — there is no
+/// "skipped" path, so an unverified binary can never be installed. The
+/// manifest download goes through `fetch` so tests can inject a fake one
+/// without network access.
+fn verify_release_asset(
+    asset_name: &str,
+    asset_bytes: &[u8],
+    sums_url: Option<&str>,
+    mut fetch: impl FnMut(&str) -> Result<Vec<u8>, String>,
+) -> Result<(), String> {
+    let Some(sums_url) = sums_url else {
+        return Err(format!(
+            "Release does not publish a SHA256SUMS.txt checksum manifest — refusing to install an unverified binary. \
+             Please update manually from https://github.com/{GITHUB_REPO}/releases"
+        ));
+    };
+    let sums_bytes = fetch(sums_url)?;
+    let sums_text = String::from_utf8_lossy(&sums_bytes).to_string();
+    verify_checksum(asset_name, asset_bytes, &sums_text)?;
+    Ok(())
 }
 
 /// Verifies the SHA-256 of `bytes` against the release's SHA256SUMS.txt.
@@ -253,7 +310,19 @@ fn looks_like_executable(bytes: &[u8]) -> bool {
 }
 
 /// Checks the latest release and optionally executes an atomic binary upgrade.
+#[cfg_attr(feature = "publisher", allow(unreachable_code))]
 pub fn execute_update(check_only: bool) -> Result<(), String> {
+    // Maintainer `publisher` builds must never be replaced by the public
+    // distribution binaries downloaded from the release channel — they carry
+    // capabilities that are intentionally excluded from distributed builds.
+    #[cfg(feature = "publisher")]
+    {
+        let _ = check_only;
+        println!("Publisher build detected: automatic updates are disabled for this profile.");
+        println!("Rebuild from source with `cargo build --release --features publisher` instead.");
+        return Ok(());
+    }
+
     let current_version = env!("CARGO_PKG_VERSION");
     let user_agent = format!("mbhub-updater/{current_version}");
     let current_exe = std::env::current_exe().map_err(|e| format!("Cannot locate current executable: {e}"))?;
@@ -321,18 +390,12 @@ pub fn execute_update(check_only: bool) -> Result<(), String> {
     let asset_bytes = download_bytes(&asset_url, &user_agent, Duration::from_secs(120))?;
 
     // Cryptographic verification against the release's SHA256SUMS.txt.
-    // When the manifest is available, verification is mandatory.
-    match sums_url {
-        Some(sums_url) => {
-            let sums_bytes = download_bytes(&sums_url, &user_agent, Duration::from_secs(60))?;
-            let sums_text = String::from_utf8_lossy(&sums_bytes).to_string();
-            verify_checksum(&asset_name, &asset_bytes, &sums_text)?;
-            println!("SHA-256 checksum verified against the release manifest.");
-        }
-        None => {
-            println!("Warning: release has no SHA256SUMS.txt — checksum verification skipped.");
-        }
-    }
+    // Verification is MANDATORY: a release without a checksum manifest is
+    // refused outright — an unverified binary is never installed.
+    let mut fetch_sums =
+        |url: &str| download_bytes(url, &user_agent, Duration::from_secs(60));
+    verify_release_asset(&asset_name, &asset_bytes, sums_url.as_deref(), &mut fetch_sums)?;
+    println!("SHA-256 checksum verified against the release manifest.");
 
     // Unpack the executable from the archive (or use the raw binary as-is).
     let binary_bytes = extract_binary(&asset_name, &asset_bytes)?;
@@ -508,6 +571,105 @@ mod tests {
     fn checksum_verification_requires_an_entry() {
         let sums = format!("{}  mbhub-windows-x64.zip\n", sha256_hex(b"other"));
         assert!(verify_checksum("mbhub-linux-x64.tar.gz", b"x", &sums).is_err());
+    }
+
+    #[test]
+    fn update_rejected_without_checksum_manifest() {
+        // A release without SHA256SUMS.txt must be refused — never installed
+        // with a "verification skipped" warning.
+        let result = verify_release_asset("mbhub-linux-x64.tar.gz", b"bytes", None, |_| {
+            Ok(Vec::new())
+        });
+        let err = result.unwrap_err();
+        assert!(err.contains("SHA256SUMS.txt"), "error should name the manifest: {err}");
+        assert!(err.contains("refusing"), "error must state the refusal: {err}");
+    }
+
+    #[test]
+    fn update_verifies_against_fetched_manifest() {
+        let bytes = b"release-bytes".to_vec();
+        let sums = format!("{}  mbhub-linux-x64.tar.gz\n", sha256_hex(&bytes));
+
+        // Fake manifest "download" — no network involved.
+        let mut fetch_ok = |url: &str| -> Result<Vec<u8>, String> {
+            assert!(url.ends_with("SHA256SUMS.txt"));
+            Ok(sums.clone().into_bytes())
+        };
+        assert!(verify_release_asset("mbhub-linux-x64.tar.gz", &bytes, Some("https://example/SHA256SUMS.txt"), &mut fetch_ok).is_ok());
+
+        // A tampered payload must be rejected even when the manifest exists.
+        let tampered = b"release-bytes-EVIL".to_vec();
+        let mut fetch_ok2 = move |_url: &str| -> Result<Vec<u8>, String> {
+            Ok(sums.clone().into_bytes())
+        };
+        assert!(verify_release_asset("mbhub-linux-x64.tar.gz", &tampered, Some("https://example/SHA256SUMS.txt"), &mut fetch_ok2).is_err());
+
+        // A failing manifest download fails the update (fail closed).
+        let mut fetch_fail = |_url: &str| -> Result<Vec<u8>, String> {
+            Err("Failed to download manifest".to_string())
+        };
+        assert!(verify_release_asset("mbhub-linux-x64.tar.gz", &bytes, Some("https://example/SHA256SUMS.txt"), &mut fetch_fail).is_err());
+    }
+
+    fn build_tar_gz(payload: &[u8]) -> Vec<u8> {
+        let mut archive_bytes = Vec::new();
+        {
+            let encoder = flate2::write::GzEncoder::new(&mut archive_bytes, flate2::Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "mbhub", payload)
+                .expect("appends file");
+            let encoder = builder.into_inner().expect("finish tar");
+            encoder.finish().expect("finish gz");
+        }
+        archive_bytes
+    }
+
+    fn build_zip(payload: &[u8]) -> Vec<u8> {
+        let mut archive_bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut archive_bytes));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file("mbhub.exe", options).expect("starts file");
+            writer.write_all(payload).expect("writes payload");
+            writer.finish().expect("finishes archive");
+        }
+        archive_bytes
+    }
+
+    #[test]
+    fn tar_extraction_enforces_decompression_bomb_cap() {
+        // 1 MiB of zeros compresses to a few KB — a classic bomb shape.
+        let payload = vec![0u8; 1024 * 1024];
+        let archive = build_tar_gz(&payload);
+
+        // Below the cap the extraction is refused.
+        let err = extract_binary_capped("mbhub-linux-x64.tar.gz", &archive, 64 * 1024).unwrap_err();
+        assert!(err.contains("decompression bomb"), "unexpected error: {err}");
+
+        // Above the cap the same archive extracts fine.
+        let ok = extract_binary_capped("mbhub-linux-x64.tar.gz", &archive, 2 * 1024 * 1024).unwrap();
+        assert_eq!(ok, payload);
+
+        // The public entry point uses the 256 MiB production cap.
+        assert_eq!(extract_binary("mbhub-linux-x64.tar.gz", &archive).unwrap(), payload);
+    }
+
+    #[test]
+    fn zip_extraction_enforces_decompression_bomb_cap() {
+        let payload = vec![0u8; 1024 * 1024];
+        let archive = build_zip(&payload);
+
+        let err = extract_binary_capped("mbhub-windows-x64.zip", &archive, 64 * 1024).unwrap_err();
+        assert!(err.contains("decompression bomb"), "unexpected error: {err}");
+
+        let ok = extract_binary_capped("mbhub-windows-x64.zip", &archive, 2 * 1024 * 1024).unwrap();
+        assert_eq!(ok, payload);
     }
 
     #[test]

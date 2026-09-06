@@ -74,24 +74,33 @@ pub fn uninstall() -> Result<(), String> {
     }
 }
 
+/// Broken-pipe-safe stdout write: `mbhub status | head` closes the pipe
+/// early; `println!` would panic on EPIPE, this just stops printing.
+fn print_line(text: &str) {
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    let _ = writeln!(stdout, "{text}");
+    let _ = stdout.flush();
+}
+
 /// Checks the operational status of the service and P2P swarm.
 pub fn status() {
-    println!("Checking MBHub service status...\n");
+    print_line("Checking MBHub service status...\n");
 
     if let Some(resp) = try_query_daemon(&IpcRequest::Status) {
         if let IpcResponse::Status { running: _, peers, reserved_gb, records } = resp {
-            println!("Status:          RUNNING");
-            println!("P2P Swarm Peers: {} online", peers);
-            println!("Memory Records:  {} cached", records);
-            println!("Reserved Space:  {} GB", reserved_gb);
-            println!("\nService is healthy and responding to queries.");
+            print_line("Status:          RUNNING");
+            print_line(&format!("P2P Swarm Peers: {peers} online"));
+            print_line(&format!("Memory Records:  {records} cached"));
+            print_line(&format!("Reserved Space:  {reserved_gb} GB"));
+            print_line("\nService is healthy and responding to queries.");
             return;
         }
     }
 
-    println!("Status:          STOPPED (Daemon is not responding to IPC)");
-    println!("\nTo start the service, run: mbhub service start");
-    println!("To run in foreground, run: mbhub daemon");
+    print_line("Status:          STOPPED (Daemon is not responding to IPC)");
+    print_line("\nTo start the service, run: mbhub service start");
+    print_line("To run in foreground, run: mbhub daemon");
 }
 
 /// Starts the installed service.

@@ -219,6 +219,17 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                         false,
                     );
                 }
+                #[cfg(feature = "publisher")]
+                SettingsField::SyncWebArchive => {
+                    row(
+                        frame,
+                        rows[row_idx],
+                        "Sync Web Archive",
+                        "Publish to mbhub.dev…",
+                        focus == SettingsField::SyncWebArchive,
+                        false,
+                    );
+                }
                 SettingsField::ClearCache => {
                     row(
                         frame,
@@ -239,6 +250,9 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
                         false,
                     );
                 }
+                // Fields hidden from non-publisher builds resolve to no-op.
+                #[cfg(not(feature = "publisher"))]
+                _ => {}
             },
             SettingItem::ApiEndpoint => {
                 row(
@@ -439,6 +453,12 @@ fn field_help(
             "Restores a previously exported .db backup file. Your live SQLite database will be replaced with this snapshot, and all restored records will be immediately browsable in Memory.",
             "Enter : open file manager",
         ),
+        #[cfg(feature = "publisher")]
+        SettingsField::SyncWebArchive => (
+            "Sync Web Archive (mbhub.dev)",
+            "Initiates background synchronization between local verified candidates and the public collective memory website at https://mbhub.dev. Protects indexed URLs from deletion.",
+            "Enter : trigger immediate sync & deploy",
+        ),
         SettingsField::ClearCache => (
             "Clear storage cache",
             "Purges all locally stored inference records and resets the local database. The database will remain completely empty until new queries are executed.",
@@ -449,6 +469,9 @@ fn field_help(
             "Review the complete 17-section decentralized P2P operational agreement, safety boundaries, BYOK terms, and open-source licensing framework.",
             "Enter : open agreement in viewer",
         ),
+        // Fields hidden from non-publisher builds resolve to no-op.
+        #[cfg(not(feature = "publisher"))]
+        _ => ("", "", ""),
     }
 }
 

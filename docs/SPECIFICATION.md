@@ -1,6 +1,6 @@
 # MBHub Master Technical Specification & Architecture Manual
 
-**Version:** 1.0.0  
+**Version:** 1.0.1  
 **Status:** Active Single Source of Truth  
 **Date:** September 2026  
 **Security Model:** Zero-Trust, Serverless, Cryptographically Verifiable, BYOK (Bring Your Own Key)
@@ -83,7 +83,7 @@ When a user submits a query via the TUI, headless CLI, or MCP interface, MBHub e
 1. **Normalization & SimHash Generation:** The query is normalized under Unicode NFKC, lowercased, and stripped of punctuation. A 64-bit SimHash fingerprint is computed. SimHash measures semantic similarity as a percentage (0.0%–100.0%) via Hamming distance.
 2. **Pre-Flight DLP Gate:** The input is scanned against sensitive credential patterns (API keys, private keys, JWT tokens, credit card numbers). Any match triggers an immediate hard block modal.
 3. **Layer 1 (L1) — Local SQLite Scan (0–5 ms):** Scans the local database against the user's configured **Hit Rate Threshold** (70%–99%, default 85%) and **Answer Freshness** policy. On hit, the cached response renders immediately.
-4. **Layer 2 (L2) — P2P Swarm Query (up to 600 ms):** If L1 misses, an encrypted query is dispatched over libp2p GossipSub via Noise-encrypted tunnels with 50–300 ms anti-correlation jitter. Verified peer responses under 64 KB are persisted locally and displayed.
+4. **Layer 2 (L2) — P2P Swarm Query (up to 2.5 s):** If L1 misses, an encrypted query is dispatched over libp2p GossipSub via Noise-encrypted tunnels with 50–300 ms anti-correlation jitter. The deadline covers the GossipSub mesh-settling window; failed publishes are retried within a bounded window so the first query after joining is not lost. A node with zero connected peers skips L2 instantly. Verified peer responses under 64 KB are persisted locally and displayed.
 5. **Layer 3 (L3) — Live Cloud Model Inference (Streaming):** If L2 misses (or if forced via `Ctrl+Enter`), MBHub establishes a TLS 1.3 streaming connection to the configured provider. The response streams in real-time, passes post-flight redaction, is saved to SQLite, and (if from an authentic cloud provider) is gossiped to the mesh (`is_swarm = false`).
 
 ### 2.2 Layout & Wire Budget
@@ -185,7 +185,35 @@ To guarantee an $O(1)$ memory footprint of **15–25 MB RAM** across databases h
 
 ---
 
-## 6. Two-Node Swarm Verification Procedure
+## 6. Peer Discovery Layer (Kademlia DHT)
+
+MBHub's discovery layer implements the "every peer is an introducer" design: only the very first contact requires a known address; afterwards the network itself performs all introductions.
+
+### 6.1 Composition
+* **Kademlia DHT (`/mbhub/kad/1.0.0`):** libp2p `kad` over a memory record store, used purely for peer routing. Nodes start in client mode and automatically flip to server mode once a verified external address is confirmed — every reachable node answers routing queries for others.
+* **identify:** protocol/agent exchange; exchanged listen addresses feed the routing table (`NewExternalAddrOfPeer` → `kad.add_address`).
+* **AutoNAT:** dial-back probes verify external reachability; a `Public` verdict confirms the observed address.
+* **UPnP:** automatic gateway port mapping where supported (confirmed address feeding the same path).
+* **DCUtR:** direct-connection upgrade (hole punching) through relayed connections.
+* **Circuit relay v2 (client):** fallback transport for hard-NAT'd nodes; reservations on bootstrap/community relay nodes carry coordination only, never content.
+* **mDNS:** free discovery of peers on the local network.
+
+### 6.2 Bootstrap Sources (priority order)
+1. `MBHUB_BOOTSTRAP_PEERS` — comma-separated multiaddrs (operator override, cap 16).
+2. Embedded compile-time defaults.
+3. `https://mbhub.dev/bootstrap.json` — TLS-only, 3 s timeout, 64 KB payload ceiling, deduplicated/capped; result cached atomically (0600) to `~/.mbhub/bootstrap-cache.json`; re-fetched every 30 minutes.
+4. The local cache when the remote is unreachable.
+
+`kad.bootstrap()` runs at startup, on a 10-minute cadence, and after manifest refreshes (kad's own 5-minute periodic bootstrap remains active).
+
+### 6.3 Listening & Observability
+* Default listen port: **37777** (`MBHUB_LISTEN_PORT` override; ephemeral fallback on collision).
+* Dial successes/failures, connect/disconnect, DHT routing-table growth, NAT status flips, relay reservations, and a 60-second `status: peers=N kad=<mode>` line are all written to `~/.mbhub/mbhub.log`.
+* `mbhub bootstrap` runs a dedicated rendezvous node (Kademlia server + relay server with strict reservation/circuit caps, no gossipsub storage, no database) for community-hosted entry points.
+
+---
+
+## 7. Two-Node Swarm Verification Procedure
 
 To manually test P2P synchronization between two independent nodes on a local machine:
 
@@ -206,11 +234,13 @@ Within 3–5 seconds, the top status bar on both nodes displays `PEERS: 1`, and 
 
 ---
 
-## 7. Verification & Automated Test Suite
+## 8. Verification & Automated Test Suite
 
-MBHub v1.0.0 is verified with **157 passing automated tests**:
+MBHub is verified with **169 passing automated tests**:
 
 * **Unit Tests:** DLP redaction, ANSI terminal sanitization, BLAKE3 content-hashing, SimHash Hamming distances, Ed25519 identity key generation and repair.
 * **Integration Tests:** Pipeline routing (L1 $\rightarrow$ L2 $\rightarrow$ L3), wire integrity gates, anti-poison filters, replay deduplication, and storage quota enforcement.
 * **MCP Integration:** Stdio JSON-RPC 2.0 handshake (`initialize`, `tools/list`, `tools/call`, `ping`).
 * **P2P Swarm Network Test (`two_swarms_connect_and_gossip_inference`):** Spawns two in-memory libp2p swarms over Noise + Yamux + GossipSub, gossips signed inferences, and verifies end-to-end receipt and database persistence.
+* **DHT Discovery Test (`kad_bootstrap_via_single_seed_node`):** Verifies the production bootstrap path — one seed address opens the Kademlia routing table.
+* **Signed Tombstone Tests:** valid signatures accepted end-to-end; unsigned/tampered/mis-attributed tombstones rejected at the swarm edge.

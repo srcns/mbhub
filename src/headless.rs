@@ -46,8 +46,8 @@ pub fn execute_ask(query: &str, p2p: Option<&P2pHandle>) -> Result<IpcResponse, 
 
     if let Some(cached) = crate::db::find_best_match_query_fresh(trimmed, min_sim, min_ts) {
         return Ok(IpcResponse::Answer {
-            question: cached.question,
-            content: cached.content,
+            question: crate::sanitize::strip_control_chars(&cached.question),
+            content: crate::sanitize::strip_control_chars(&cached.content),
             source: if cached.is_swarm {
                 "L2 (swarm cached)".to_string()
             } else {
@@ -77,8 +77,11 @@ pub fn execute_ask(query: &str, p2p: Option<&P2pHandle>) -> Result<IpcResponse, 
                 min_similarity: min_sim,
             });
 
-            // Wait up to 600 ms deadline for swarm response
-            let deadline = Instant::now() + Duration::from_millis(600);
+            // Wait up to 2.5 s for a swarm response. GossipSub mesh
+            // membership settles a heartbeat or two after connecting, so the
+            // deadline must exceed the publish retry window; a node with no
+            // peers still falls through to L3 instantly (gate is above).
+            let deadline = Instant::now() + Duration::from_millis(2_500);
             while Instant::now() < deadline {
                 if let Ok(resp) = p.query_response_rx.try_recv() {
                     if resp.request_id == request_id {
@@ -112,8 +115,13 @@ pub fn execute_ask(query: &str, p2p: Option<&P2pHandle>) -> Result<IpcResponse, 
                                 );
 
                                 return Ok(IpcResponse::Answer {
-                                    question: resp.question,
-                                    content: resp.content,
+                                    // Sanitize at the SOURCE (Y1): peer
+                                    // content is printed raw by `mbhub ask`;
+                                    // control characters / terminal escape
+                                    // sequences (OSC 52 clipboard hijack)
+                                    // must never reach the terminal.
+                                    question: crate::sanitize::strip_control_chars(&resp.question),
+                                    content: crate::sanitize::strip_control_chars(&resp.content),
                                     source: "L2 (swarm P2P)".to_string(),
                                     similarity: min_sim as f64,
                                     is_swarm: true,
@@ -181,7 +189,13 @@ pub fn execute_ask(query: &str, p2p: Option<&P2pHandle>) -> Result<IpcResponse, 
         }
     }
 
-    let redacted_response = crate::dlp::redact_secrets(&full_response);
+    // Sanitize at the SOURCE (Y1): strip terminal control characters before
+    // hashing, storing, broadcasting, and returning the provider output so
+    // every downstream consumer (DB, P2P peers, terminal) sees the same
+    // canonical text.
+    let redacted_response = crate::sanitize::strip_control_chars(&crate::dlp::redact_secrets(
+        &full_response,
+    ));
     if redacted_response.trim().is_empty() || redacted_response.trim().len() < 10 {
         return Err("AI Provider Error: Model returned an empty or insufficient response.".to_string());
     }
