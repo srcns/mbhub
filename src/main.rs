@@ -25,6 +25,7 @@ mod service;
 mod simhash;
 mod theme;
 mod tos;
+mod uninstall;
 mod ui;
 mod update;
 
@@ -91,6 +92,10 @@ fn main() -> io::Result<()> {
             "status" => {
                 service::status();
                 return Ok(());
+            }
+            "uninstall" => {
+                return uninstall::run_uninstall_tui()
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
             }
             "update" => {
                 let check_only = args.iter().any(|a| a == "--check");
@@ -564,6 +569,7 @@ fn print_cli_help() {
     println!("  mbhub ask <query> [--json] Ask a question via headless 3-layer pipeline");
     println!("  mbhub daemon              Run the 24/7 background P2P & IPC daemon");
     println!("  mbhub bootstrap           Run a dedicated rendezvous node (Kademlia + relay server, no data)");
+    println!("  mbhub uninstall           Interactive uninstaller — choose what to remove and what to keep");
     println!("  mbhub mcp [--accept-terms] Start stdio JSON-RPC 2.0 MCP server (Cursor, Claude, agents)");
     #[cfg(feature = "publisher")]
     {

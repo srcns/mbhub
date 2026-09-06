@@ -8,6 +8,74 @@ use std::process::Command;
 
 use crate::ipc::{try_query_daemon, IpcRequest, IpcResponse};
 
+/// Embedded launcher icons (iOS-style rounded square, centered mark).
+/// Regenerate with `assets/icons/generate.sh` after logo changes.
+const ICON_PNG_512: &[u8] = include_bytes!("../assets/icons/hicolor/512x512/apps/mbhub.png");
+const ICON_PNG_256: &[u8] = include_bytes!("../assets/icons/hicolor/256x256/apps/mbhub.png");
+const ICON_PNG_128: &[u8] = include_bytes!("../assets/icons/hicolor/128x128/apps/mbhub.png");
+const ICON_PNG_64: &[u8] = include_bytes!("../assets/icons/hicolor/64x64/apps/mbhub.png");
+const ICON_PNG_48: &[u8] = include_bytes!("../assets/icons/hicolor/48x48/apps/mbhub.png");
+const ICON_PNG_32: &[u8] = include_bytes!("../assets/icons/hicolor/32x32/apps/mbhub.png");
+pub const ICON_ICO: &[u8] = include_bytes!("../assets/icons/mbhub.ico");
+
+/// Installs the freedesktop hicolor icon set into the user's icon
+/// directory and refreshes the desktop icon cache when available.
+pub fn install_icons() -> Result<(), String> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| "HOME not set".to_string())?;
+    let icons: [(&str, &[u8]); 6] = [
+        ("512x512", ICON_PNG_512),
+        ("256x256", ICON_PNG_256),
+        ("128x128", ICON_PNG_128),
+        ("64x64", ICON_PNG_64),
+        ("48x48", ICON_PNG_48),
+        ("32x32", ICON_PNG_32),
+    ];
+    for (size, bytes) in icons {
+        let dir = PathBuf::from(&home)
+            .join(".local/share/icons/hicolor")
+            .join(size)
+            .join("apps");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Failed to create icon dir {}: {}", dir.display(), e))?;
+        let file = dir.join("mbhub.png");
+        std::fs::write(&file, bytes)
+            .map_err(|e| format!("Failed to write {}: {}", file.display(), e))?;
+    }
+    // Best-effort cache refresh (older desktops need it).
+    let _ = Command::new("gtk-update-icon-cache")
+        .arg("-q")
+        .arg("-f")
+        .arg(PathBuf::from(&home).join(".local/share/icons/hicolor"))
+        .status();
+    Ok(())
+}
+
+/// Removes the installed hicolor icon set (uninstaller helper).
+pub fn remove_icons() {
+    let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) else {
+        return;
+    };
+    for size in ["512x512", "256x256", "128x128", "64x64", "48x48", "32x32"] {
+        let _ = std::fs::remove_file(
+            PathBuf::from(&home)
+                .join(".local/share/icons/hicolor")
+                .join(size)
+                .join("apps/mbhub.png"),
+        );
+    }
+}
+
+/// Removes the application launcher (uninstaller helper).
+pub fn remove_desktop_shortcut() {
+    if let Ok(home) = std::env::var("HOME") {
+        let _ = std::fs::remove_file(
+            PathBuf::from(&home).join(".local/share/applications/mbhub.desktop"),
+        );
+    }
+}
+
 /// Installs MBHub daemon as a system background service that auto-starts on login.
 pub fn install() -> Result<(), String> {
     let exe = std::env::current_exe()
@@ -40,7 +108,8 @@ pub fn install() -> Result<(), String> {
     // 2. Auto-configure MCP servers in Claude Desktop and Cursor (zero-friction)
     let _ = auto_configure_mcp();
 
-    // 3. Create desktop launcher / shortcut
+    // 3. Create desktop launcher / shortcut (with branded icon)
+    let _ = install_icons();
     let _ = create_desktop_shortcut(exe_str);
 
     println!("\n[MBHub] Zero-friction installation complete!");
@@ -473,7 +542,9 @@ fn create_desktop_shortcut(exe_path: &str) -> Result<(), String> {
                  Terminal=true\n\
                  Type=Application\n\
                  Categories=Development;Utility;\n\
-                 Keywords=ai;p2p;memory;llm;mcp;\n",
+                 Keywords=ai;p2p;memory;llm;mcp;\n\
+                 Icon=mbhub\n\
+                 StartupWMClass=mbhub\n",
                 exe_path
             );
             let _ = std::fs::write(&desktop_file, content);
@@ -482,13 +553,24 @@ fn create_desktop_shortcut(exe_path: &str) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
+        // Branded icon next to the Start Menu shortcut.
+        let ico_dir = PathBuf::from(
+            std::env::var("APPDATA").unwrap_or_else(|_| std::env::var("HOME").unwrap_or_default()),
+        )
+        .join("mbhub");
+        let _ = std::fs::create_dir_all(&ico_dir);
+        let ico_path = ico_dir.join("mbhub.ico");
+        let _ = std::fs::write(&ico_path, ICON_ICO);
+        let ico_str = ico_path.to_string_lossy().replace('/', "\\");
         let script = format!(
             "$ws = New-Object -ComObject WScript.Shell; \
              $s = $ws.CreateShortcut(\"$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs\\MBHub.lnk\"); \
              $s.TargetPath = \"{}\"; \
+             $s.IconLocation = \"{}, 0\"; \
              $s.Description = \"MBHub Sovereign P2P Memory\"; \
              $s.Save()",
-            exe_path.replace('/', "\\")
+            exe_path.replace('/', "\\"),
+            ico_str
         );
         let _ = Command::new("powershell").args(["-NoProfile", "-Command", &script]).status();
     }
