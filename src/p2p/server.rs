@@ -20,9 +20,9 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use libp2p::Multiaddr;
 use libp2p::futures::StreamExt;
 use libp2p::swarm::SwarmEvent;
-use libp2p::Multiaddr;
 use libp2p_swarm_derive::NetworkBehaviour;
 
 use crate::p2p::bootstrap;
@@ -65,10 +65,7 @@ struct BootstrapBehaviour {
 
 fn build_bootstrap_swarm(
     keypair: &libp2p::identity::Keypair,
-) -> Result<
-    libp2p::Swarm<BootstrapBehaviour>,
-    Box<dyn std::error::Error + Send + Sync>,
-> {
+) -> Result<libp2p::Swarm<BootstrapBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
     let peer_id = keypair.public().to_peer_id();
 
     let mut kad_config = libp2p::kad::Config::new(libp2p::StreamProtocol::new(
@@ -81,10 +78,7 @@ fn build_bootstrap_swarm(
             crate::p2p::behaviour::IDENTIFY_PROTOCOL_VERSION.to_string(),
             keypair.public(),
         )
-        .with_agent_version(format!(
-            "mbhub-bootstrap/{}",
-            env!("CARGO_PKG_VERSION")
-        )),
+        .with_agent_version(format!("mbhub-bootstrap/{}", env!("CARGO_PKG_VERSION"))),
     );
 
     let limits = libp2p::connection_limits::ConnectionLimits::default()
@@ -93,34 +87,36 @@ fn build_bootstrap_swarm(
         .with_max_pending_incoming(Some(SERVER_MAX_CONNECTIONS))
         .with_max_pending_outgoing(Some(SERVER_MAX_CONNECTIONS));
 
-    Ok(libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
-        .with_tokio()
-        .with_tcp(
-            libp2p::tcp::Config::default(),
-            libp2p::noise::Config::new,
-            libp2p::yamux::Config::default,
-        )?
-        .with_behaviour(move |_keypair| BootstrapBehaviour {
-            kad: libp2p::kad::Behaviour::with_config(
-                peer_id,
-                libp2p::kad::store::MemoryStore::new(peer_id),
-                kad_config,
-            ),
-            identify,
-            autonat: libp2p::autonat::Behaviour::new(
-                peer_id,
-                libp2p::autonat::Config::default(),
-            ),
-            relay: libp2p::relay::Behaviour::new(peer_id, relay_server_config()),
-            limits: libp2p::connection_limits::Behaviour::new(limits),
-        })?
-        .with_swarm_config(|c| {
-            // Rendezvous nodes must stay interconnected: the same libp2p 0.56
-            // 10 s idle timeout would let the server↔server link flap whenever
-            // both go quiet between DHT bursts.
-            c.with_idle_connection_timeout(Duration::from_secs(600))
-        })
-        .build())
+    Ok(
+        libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default(),
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )?
+            .with_behaviour(move |_keypair| BootstrapBehaviour {
+                kad: libp2p::kad::Behaviour::with_config(
+                    peer_id,
+                    libp2p::kad::store::MemoryStore::new(peer_id),
+                    kad_config,
+                ),
+                identify,
+                autonat: libp2p::autonat::Behaviour::new(
+                    peer_id,
+                    libp2p::autonat::Config::default(),
+                ),
+                relay: libp2p::relay::Behaviour::new(peer_id, relay_server_config()),
+                limits: libp2p::connection_limits::Behaviour::new(limits),
+            })?
+            .with_swarm_config(|c| {
+                // Rendezvous nodes must stay interconnected: the same libp2p 0.56
+                // 10 s idle timeout would let the server↔server link flap whenever
+                // both go quiet between DHT bursts.
+                c.with_idle_connection_timeout(Duration::from_secs(600))
+            })
+            .build(),
+    )
 }
 
 /// Logs one lifecycle line (same channel/format as the client service).
@@ -296,7 +292,15 @@ pub fn run_bootstrap_server() -> Result<(), String> {
                         SwarmEvent::Behaviour(BootstrapBehaviourEvent::Identify(
                             libp2p::identify::Event::Received { peer_id, info, .. },
                         )) => {
+                            // Hardened rendezvous: only globally-routable
+                            // addresses enter the DHT. A malicious identify
+                            // payload must not be able to turn this public
+                            // bootstrap node into a dial-back amplifier
+                            // against private or third-party IPs.
                             for addr in &info.listen_addrs {
+                                if !crate::p2p::service::is_public_candidate(addr) {
+                                    continue;
+                                }
                                 swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
                             }
                         }

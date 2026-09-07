@@ -29,9 +29,12 @@ fn default_hop_ttl() -> u8 {
 ///
 /// Integrity: `content_hash` is the BLAKE3 hash over the
 /// sanitized `(question, content, provider, model)` fields. Receivers MUST
-/// recompute and compare before storing; mismatches are dropped. Legacy
-/// senders without the field fail verification and are dropped by receivers
-/// running this version.
+/// recompute and compare before storing; mismatches are dropped.
+///
+/// Attribution (v1.0.1 major upgrade): every inference MUST carry an Ed25519
+/// `signature` made by the gossip author over [`SwarmInferenceMessage::signing_payload`].
+/// Receivers verify it against the authenticate peers' public key before the
+/// record may be stored — poisoning becomes attributable and ban-able.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SwarmInferenceMessage {
     pub question: String,
@@ -52,6 +55,10 @@ pub struct SwarmInferenceMessage {
     /// flooding the network with content, independent of identity count.
     #[serde(default)]
     pub pow: String,
+    /// Ed25519 signature by the gossip author over [`Self::signing_payload`].
+    /// Required on the wire — unsigned records are dropped at the edge.
+    #[serde(default)]
+    pub signature: Vec<u8>,
     /// Gossip-authenticated distributor of this record. Transport metadata:
     /// never serialized (receivers derive it from the signed gossip author,
     /// which cannot be spoofed). Powers local publisher bans.
@@ -136,6 +143,27 @@ pub fn verify_publish_pow(
 }
 
 impl SwarmInferenceMessage {
+    /// Canonical byte payload covered by the author signature: every
+    /// integrity-relevant field in fixed order, strings length-prefixed to
+    /// rule out field-boundary ambiguity.
+    pub fn signing_payload(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        push_field(&mut buf, &self.question);
+        push_field(&mut buf, &self.content);
+        push_field(&mut buf, &self.provider);
+        push_field(&mut buf, &self.model);
+        buf.extend_from_slice(&self.timestamp.to_le_bytes());
+        buf.extend_from_slice(&self.simhash.to_le_bytes());
+        push_field(&mut buf, &self.content_hash);
+        buf
+    }
+
+    /// Signs the record with the node identity. Called by the outgoing publish
+    /// path right before the payload hits the wire.
+    pub fn sign_with(&mut self, keypair: &libp2p::identity::Keypair) {
+        self.signature = keypair.sign(&self.signing_payload()).unwrap_or_default();
+    }
+
     /// Recomputes the canonical content hash over sanitized fields.
     pub fn canonical_content_hash(&self) -> String {
         crate::content_hash::compute_content_hash(
@@ -168,7 +196,9 @@ impl SwarmInferenceMessage {
             return false;
         }
         // Truncation detection guard: reject cut-off or interrupted answers
-        if self.content.contains("[⚠️ RESPONSE INCOMPLETE") || self.content.contains("[⚠️ YANIT KESİLDİ") {
+        if self.content.contains("[⚠️ RESPONSE INCOMPLETE")
+            || self.content.contains("[⚠️ YANIT KESİLDİ")
+        {
             return false;
         }
         if self.content_hash.is_empty() || self.content_hash != self.canonical_content_hash() {
@@ -248,6 +278,16 @@ pub struct SwarmQueryRequest {
     pub question: String,
     pub simhash: u64,
     pub min_similarity: f32,
+    /// Ed25519 signature by the asker over [`Self::signing_payload`] —
+    /// required on the wire so query spam is attributable and ban-able.
+    #[serde(default)]
+    pub signature: Vec<u8>,
+}
+
+/// Appends one length-prefixed string field to a signing payload.
+fn push_field(buf: &mut Vec<u8>, field: &str) {
+    buf.extend_from_slice(&(field.len() as u64).to_le_bytes());
+    buf.extend_from_slice(field.as_bytes());
 }
 
 impl SwarmQueryRequest {
@@ -260,6 +300,22 @@ impl SwarmQueryRequest {
             && self.min_similarity.is_finite()
             && (0.0..=100.0).contains(&self.min_similarity)
             && crate::simhash::compute_simhash(&self.question) == self.simhash
+    }
+
+    /// Canonical byte payload covered by the asker's signature.
+    pub fn signing_payload(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        push_field(&mut buf, &self.request_id);
+        push_field(&mut buf, &self.asker_peer_id);
+        push_field(&mut buf, &self.question);
+        buf.extend_from_slice(&self.simhash.to_le_bytes());
+        buf.extend_from_slice(&self.min_similarity.to_le_bytes());
+        buf
+    }
+
+    /// Signs the query with the node identity (outgoing publish path).
+    pub fn sign_with(&mut self, keypair: &libp2p::identity::Keypair) {
+        self.signature = keypair.sign(&self.signing_payload()).unwrap_or_default();
     }
 }
 
@@ -279,7 +335,23 @@ pub struct SwarmQueryResponse {
     pub model: String,
     #[serde(default)]
     pub content_hash: String,
+    /// Response proof-of-work over (responder pubkey ‖ content_hash ‖ nonce)
+    /// at [`RESPONSE_POW_DIFFICULTY_BITS`] — closes the zero-cost content
+    /// injection route through the query-response channel.
+    #[serde(default)]
+    pub pow: String,
+    /// Ed25519 signature by the responder over [`Self::signing_payload`] —
+    /// required on the wire; responses are attributable and ban-able.
+    #[serde(default)]
+    pub signature: Vec<u8>,
 }
+
+/// Leading zero bits required in the response proof-of-work. ~256× cheaper
+/// than the publish PoW so answering a peer's query stays snappy on the
+/// swarm thread, while still taxing response flooding: at the 20 msg/s
+/// per-author query cap, a flooder must burn continuous CPU to keep every
+/// answer accepted — and every response is attributable via its signature.
+pub const RESPONSE_POW_DIFFICULTY_BITS: u32 = 16;
 
 impl SwarmQueryResponse {
     /// Recomputes the canonical content hash over sanitized fields.
@@ -290,6 +362,30 @@ impl SwarmQueryResponse {
             &crate::sanitize::strip_control_chars(&self.provider),
             &crate::sanitize::strip_control_chars(&self.model),
         )
+    }
+
+    /// Canonical byte payload covered by the responder's signature.
+    pub fn signing_payload(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        push_field(&mut buf, &self.request_id);
+        push_field(&mut buf, &self.question);
+        push_field(&mut buf, &self.content);
+        push_field(&mut buf, &self.provider);
+        push_field(&mut buf, &self.model);
+        buf.extend_from_slice(&self.simhash.to_le_bytes());
+        push_field(&mut buf, &self.content_hash);
+        buf
+    }
+
+    /// Applies the response PoW and the responder signature (outgoing path).
+    pub fn seal_with(&mut self, keypair: &libp2p::identity::Keypair) {
+        let pubkey = keypair.public().encode_protobuf();
+        self.pow = solve_publish_pow_with_difficulty(
+            &pubkey,
+            &self.content_hash,
+            RESPONSE_POW_DIFFICULTY_BITS,
+        );
+        self.signature = keypair.sign(&self.signing_payload()).unwrap_or_default();
     }
 
     /// Receiver-side integrity check: payload ceiling + anti-poison + truncation guard + content hash match.
@@ -306,7 +402,9 @@ impl SwarmQueryResponse {
             return false;
         }
         // Truncation detection guard: reject cut-off or interrupted answers
-        if self.content.contains("[⚠️ RESPONSE INCOMPLETE") || self.content.contains("[⚠️ YANIT KESİLDİ") {
+        if self.content.contains("[⚠️ RESPONSE INCOMPLETE")
+            || self.content.contains("[⚠️ YANIT KESİLDİ")
+        {
             return false;
         }
         !self.content_hash.is_empty() && self.content_hash == self.canonical_content_hash()
@@ -341,7 +439,12 @@ mod tests {
         assert!(!verify_publish_pow(&pubkey, &"b".repeat(64), &pow, 12));
 
         // Garbage nonce fails.
-        assert!(!verify_publish_pow(&pubkey, &content_hash, "not-a-number", 12));
+        assert!(!verify_publish_pow(
+            &pubkey,
+            &content_hash,
+            "not-a-number",
+            12
+        ));
     }
 
     fn sample_message() -> SwarmInferenceMessage {
@@ -356,6 +459,7 @@ mod tests {
             hop_ttl: MAX_HOP_TTL,
             is_truncated: false,
             pow: String::new(),
+            signature: Vec::new(),
             author_peer_id: String::new(),
         }
     }
@@ -372,7 +476,8 @@ mod tests {
 
         // When content contains the truncation warning marker, integrity check must reject
         msg.is_truncated = false;
-        msg.content.push_str("\n\n[⚠️ RESPONSE INCOMPLETE: Stream interrupted]");
+        msg.content
+            .push_str("\n\n[⚠️ RESPONSE INCOMPLETE: Stream interrupted]");
         msg.content_hash = msg.canonical_content_hash();
         assert!(!msg.passes_integrity_checks(msg.timestamp));
     }
@@ -460,6 +565,8 @@ mod tests {
             provider: "Anthropic".to_string(),
             model: "claude-3-5-sonnet".to_string(),
             content_hash: String::new(),
+            pow: String::new(),
+            signature: Vec::new(),
         };
         assert!(!resp.passes_integrity_checks());
 
@@ -478,6 +585,7 @@ mod tests {
             question: "What is Raft consensus?".to_string(),
             simhash: 0xAABBCCDDEEFF0011,
             min_similarity: 85.0,
+            signature: Vec::new(),
         };
         let req_bytes = serde_json::to_vec(&req).unwrap();
         let parsed_req: SwarmQueryRequest = serde_json::from_slice(&req_bytes).unwrap();
@@ -493,6 +601,8 @@ mod tests {
             provider: "Anthropic".to_string(),
             model: "claude-3-5-sonnet".to_string(),
             content_hash: String::new(),
+            pow: String::new(),
+            signature: Vec::new(),
         };
         resp.content_hash = resp.canonical_content_hash();
         let resp_bytes = serde_json::to_vec(&resp).unwrap();
@@ -508,17 +618,26 @@ mod tests {
         let mut msg = sample_message();
         msg.content = "   ".to_string();
         msg.content_hash = msg.canonical_content_hash();
-        assert!(!msg.passes_integrity_checks(msg.timestamp), "empty content must be rejected");
+        assert!(
+            !msg.passes_integrity_checks(msg.timestamp),
+            "empty content must be rejected"
+        );
 
         let mut short_c = sample_message();
         short_c.content = "short".to_string();
         short_c.content_hash = short_c.canonical_content_hash();
-        assert!(!short_c.passes_integrity_checks(short_c.timestamp), "content < 10 chars must be rejected");
+        assert!(
+            !short_c.passes_integrity_checks(short_c.timestamp),
+            "content < 10 chars must be rejected"
+        );
 
         let mut short_q = sample_message();
         short_q.question = "hi".to_string();
         short_q.content_hash = short_q.canonical_content_hash();
-        assert!(!short_q.passes_integrity_checks(short_q.timestamp), "question < 3 chars must be rejected");
+        assert!(
+            !short_q.passes_integrity_checks(short_q.timestamp),
+            "question < 3 chars must be rejected"
+        );
 
         // 2. SwarmQueryResponse anti-poison checks
         let mut resp = SwarmQueryResponse {
@@ -530,13 +649,21 @@ mod tests {
             provider: "OpenAI".to_string(),
             model: "gpt-4o".to_string(),
             content_hash: String::new(),
+            pow: String::new(),
+            signature: Vec::new(),
         };
         resp.content_hash = resp.canonical_content_hash();
-        assert!(!resp.passes_integrity_checks(), "empty query response content must be rejected");
+        assert!(
+            !resp.passes_integrity_checks(),
+            "empty query response content must be rejected"
+        );
 
         resp.content = "123456789".to_string(); // 9 chars
         resp.content_hash = resp.canonical_content_hash();
-        assert!(!resp.passes_integrity_checks(), "query response content < 10 chars must be rejected");
+        assert!(
+            !resp.passes_integrity_checks(),
+            "query response content < 10 chars must be rejected"
+        );
 
         // 3. SwarmQueryRequest anti-poison checks
         let req = SwarmQueryRequest {
@@ -545,8 +672,12 @@ mod tests {
             question: "hi".to_string(),
             simhash: crate::simhash::compute_simhash("hi"),
             min_similarity: 85.0,
+            signature: Vec::new(),
         };
-        assert!(!req.passes_integrity_checks(), "query request with short question must be rejected");
+        assert!(
+            !req.passes_integrity_checks(),
+            "query request with short question must be rejected"
+        );
     }
 
     #[test]

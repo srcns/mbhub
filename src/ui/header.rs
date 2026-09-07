@@ -2,10 +2,10 @@
 //! and a live status on the far right: the P2P peer count normally, or the
 //! transient web-archive sync indicator while a maintainer sync runs.
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::app::App;
 use crate::theme;
@@ -25,22 +25,14 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         Some(crate::app::SyncStatus::Done { success: true, .. }) => "SYNC: OK".to_string(),
         Some(crate::app::SyncStatus::Done { success: false, .. }) => "SYNC: FAIL".to_string(),
         None => {
-            let peers = app
-                .p2p
-                .as_ref()
-                .map(|p| p.connected_peers())
-                .unwrap_or(0);
+            let peers = app.p2p.as_ref().map(|p| p.connected_peers()).unwrap_or(0);
             format!("PEERS: {peers}")
         }
     };
 
     #[cfg(not(feature = "publisher"))]
     let status_text = {
-        let peers = app
-            .p2p
-            .as_ref()
-            .map(|p| p.connected_peers())
-            .unwrap_or(0);
+        let peers = app.p2p.as_ref().map(|p| p.connected_peers()).unwrap_or(0);
         format!("PEERS: {peers}")
     };
 

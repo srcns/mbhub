@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use crate::ipc::{try_query_daemon, IpcRequest, IpcResponse};
+use crate::ipc::{IpcRequest, IpcResponse, try_query_daemon};
 
 /// Embedded launcher icons (iOS-style rounded square, centered mark).
 /// Regenerate with `assets/icons/generate.sh` after logo changes.
@@ -157,7 +157,13 @@ pub fn status() {
     print_line("Checking MBHub service status...\n");
 
     if let Some(resp) = try_query_daemon(&IpcRequest::Status) {
-        if let IpcResponse::Status { running: _, peers, reserved_gb, records } = resp {
+        if let IpcResponse::Status {
+            running: _,
+            peers,
+            reserved_gb,
+            records,
+        } = resp
+        {
             print_line("Status:          RUNNING");
             print_line(&format!("P2P Swarm Peers: {peers} online"));
             print_line(&format!("Memory Records:  {records} cached"));
@@ -261,7 +267,10 @@ pub fn stop() -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn install_linux_systemd(exe_path: &str) -> Result<(), String> {
     let home = std::env::var("HOME").map_err(|_| "HOME environment variable not set")?;
-    let unit_dir = PathBuf::from(home).join(".config").join("systemd").join("user");
+    let unit_dir = PathBuf::from(home)
+        .join(".config")
+        .join("systemd")
+        .join("user");
     std::fs::create_dir_all(&unit_dir)
         .map_err(|e| format!("Failed to create systemd user directory: {}", e))?;
 
@@ -282,10 +291,11 @@ fn install_linux_systemd(exe_path: &str) -> Result<(), String> {
         exe_path
     );
 
-    std::fs::write(&unit_file, content)
-        .map_err(|e| format!("Failed to write unit file: {}", e))?;
+    std::fs::write(&unit_file, content).map_err(|e| format!("Failed to write unit file: {}", e))?;
 
-    let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).status();
+    let _ = Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status();
     let status = Command::new("systemctl")
         .args(["--user", "enable", "--now", "mbhub"])
         .status()
@@ -303,8 +313,12 @@ fn install_linux_systemd(exe_path: &str) -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 fn uninstall_linux_systemd() -> Result<(), String> {
-    let _ = Command::new("systemctl").args(["--user", "stop", "mbhub"]).status();
-    let _ = Command::new("systemctl").args(["--user", "disable", "mbhub"]).status();
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", "mbhub"])
+        .status();
+    let _ = Command::new("systemctl")
+        .args(["--user", "disable", "mbhub"])
+        .status();
 
     let home = std::env::var("HOME").map_err(|_| "HOME environment variable not set")?;
     let unit_file = PathBuf::from(home)
@@ -317,7 +331,9 @@ fn uninstall_linux_systemd() -> Result<(), String> {
         let _ = std::fs::remove_file(unit_file);
     }
 
-    let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).status();
+    let _ = Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status();
     println!("MBHub service uninstalled.");
     Ok(())
 }
@@ -404,7 +420,9 @@ fn install_windows_task(exe_path: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to create Windows scheduled task: {}", e))?;
 
     if status.success() {
-        let _ = Command::new("schtasks").args(["/Run", "/TN", "MBHubDaemon"]).status();
+        let _ = Command::new("schtasks")
+            .args(["/Run", "/TN", "MBHubDaemon"])
+            .status();
         println!("Successfully installed and started MBHub background task on Windows.");
         Ok(())
     } else {
@@ -414,7 +432,9 @@ fn install_windows_task(exe_path: &str) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn uninstall_windows_task() -> Result<(), String> {
-    let _ = Command::new("schtasks").args(["/End", "/TN", "MBHubDaemon"]).status();
+    let _ = Command::new("schtasks")
+        .args(["/End", "/TN", "MBHubDaemon"])
+        .status();
     let status = Command::new("schtasks")
         .args(["/Delete", "/TN", "MBHubDaemon", "/F"])
         .status()
@@ -444,7 +464,8 @@ pub fn auto_configure_mcp() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     if let Ok(home) = std::env::var("HOME") {
         targets.push((
-            PathBuf::from(home).join("Library/Application Support/Claude/claude_desktop_config.json"),
+            PathBuf::from(home)
+                .join("Library/Application Support/Claude/claude_desktop_config.json"),
             "Claude Desktop (macOS)",
         ));
     }
@@ -475,7 +496,11 @@ pub fn auto_configure_mcp() -> Result<(), String> {
     // 3. Inject mbhub config into each target
     for (target, label) in targets {
         if inject_mcp_config(&target).is_ok() {
-            println!("Auto-configured MCP server in {} ({})", label, target.display());
+            println!(
+                "Auto-configured MCP server in {} ({})",
+                label,
+                target.display()
+            );
             configured_any = true;
         }
     }
@@ -490,29 +515,51 @@ fn inject_mcp_config(file_path: &PathBuf) -> Result<(), String> {
     let mut root: serde_json::Value = if file_path.exists() {
         let content = std::fs::read_to_string(file_path)
             .map_err(|e| format!("Failed to read {}: {}", file_path.display(), e))?;
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
+        match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                // Hardening: an unparseable (e.g. JSONC-with-comments) config
+                // must never be overwritten — the old fallback silently
+                // DESTROYED every other MCP server the user had configured.
+                // Abort instead; the user fixes the file or adds mbhub by hand.
+                return Err(format!(
+                    "Refusing to modify {}: existing file is not valid JSON ({}). \
+                     Fix or remove the file and re-run `mbhub service install`, \
+                     or add the mbhub server manually.",
+                    file_path.display(),
+                    e
+                ));
+            }
+        }
     } else {
         serde_json::json!({})
     };
 
-    if !root.is_object() {
-        root = serde_json::json!({});
-    }
+    let Some(root_obj) = root.as_object_mut() else {
+        return Err(format!(
+            "Refusing to modify {}: top-level JSON value is not an object.",
+            file_path.display()
+        ));
+    };
 
-    let servers = root.as_object_mut()
-        .unwrap()
+    let servers = root_obj
         .entry("mcpServers")
         .or_insert_with(|| serde_json::json!({}));
 
-    if let Some(servers_obj) = servers.as_object_mut() {
-        servers_obj.insert(
-            "mbhub".to_string(),
-            serde_json::json!({
-                "command": "mbhub",
-                "args": ["mcp", "--accept-terms"]
-            }),
-        );
-    }
+    let Some(servers_obj) = servers.as_object_mut() else {
+        return Err(format!(
+            "Refusing to modify {}: the `mcpServers` entry is not an object.",
+            file_path.display()
+        ));
+    };
+
+    servers_obj.insert(
+        "mbhub".to_string(),
+        serde_json::json!({
+            "command": "mbhub",
+            "args": ["mcp", "--accept-terms"]
+        }),
+    );
 
     let formatted = serde_json::to_string_pretty(&root)
         .map_err(|e| format!("Failed to serialize MCP JSON: {}", e))?;
@@ -521,8 +568,16 @@ fn inject_mcp_config(file_path: &PathBuf) -> Result<(), String> {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    std::fs::write(file_path, formatted)
-        .map_err(|e| format!("Failed to write {}: {}", file_path.display(), e))?;
+    // Atomic replacement (temp + rename): a crash mid-write can never leave a
+    // torn config behind, and a symlink planted at the destination is
+    // replaced rather than followed.
+    let tmp = file_path.with_extension("json.mbhub-tmp");
+    std::fs::write(&tmp, formatted.as_bytes())
+        .map_err(|e| format!("Failed to write {}: {}", tmp.display(), e))?;
+    if let Err(e) = std::fs::rename(&tmp, file_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Failed to replace {}: {}", file_path.display(), e));
+    }
 
     Ok(())
 }
@@ -537,7 +592,7 @@ fn create_desktop_shortcut(exe_path: &str) -> Result<(), String> {
             let content = format!(
                 "[Desktop Entry]\n\
                  Name=MBHub\n\
-                 Comment=Sovereign P2P Collective AI Memory Layer\n\
+                 Comment=The Torrent of Thought — Collective AI Memory\n\
                  Exec=sh -c '{} || $SHELL'\n\
                  Terminal=true\n\
                  Type=Application\n\
@@ -567,12 +622,14 @@ fn create_desktop_shortcut(exe_path: &str) -> Result<(), String> {
              $s = $ws.CreateShortcut(\"$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs\\MBHub.lnk\"); \
              $s.TargetPath = \"{}\"; \
              $s.IconLocation = \"{}, 0\"; \
-             $s.Description = \"MBHub Sovereign P2P Memory\"; \
+             $s.Description = \"MBHub - The Torrent of Thought\"; \
              $s.Save()",
             exe_path.replace('/', "\\"),
             ico_str
         );
-        let _ = Command::new("powershell").args(["-NoProfile", "-Command", &script]).status();
+        let _ = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .status();
     }
     Ok(())
 }

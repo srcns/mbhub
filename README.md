@@ -3,10 +3,10 @@
   <img src="logo-white.svg#gh-dark-mode-only" alt="MBHub Logo" width="120">
 </p>
 
-<h1 align="center">MBHub — Sovereign P2P Collective AI Memory</h1>
+<h1 align="center">MBHub — The Torrent of Thought</h1>
 
 <p align="center">
-  <strong>The Torrent of Thought: A serverless, decentralized inference cache and collaborative memory layer for AI.</strong>
+  <strong>A serverless, decentralized inference cache and collaborative memory layer for AI. Solved once, served forever.</strong>
 </p>
 
 <div align="center">
@@ -17,7 +17,7 @@ Free for personal, educational, research, and other non-commercial use. <strong>
 </div>
 
 <p align="center">
-  <a href="https://github.com/srcns/mbhub/actions"><img src="https://img.shields.io/badge/tests-192%20passed-brightgreen.svg" alt="Tests"></a>
+  <a href="https://github.com/srcns/mbhub/actions"><img src="https://img.shields.io/badge/tests-196%20passed-brightgreen.svg" alt="Tests"></a>
   <a href="https://github.com/srcns/mbhub"><img src="https://img.shields.io/badge/rust-2024%20edition-orange.svg" alt="Rust Edition"></a>
   <a href="https://github.com/srcns/mbhub"><img src="https://img.shields.io/badge/p2p-libp2p%20%2B%20noise-blue.svg" alt="P2P Protocol"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-PolyForm%20NC%201.0.0-blueviolet.svg" alt="License: PolyForm Noncommercial"></a>
@@ -234,7 +234,7 @@ MBHub maintains an exhaustive test suite verifying every component from protocol
 cargo test
 ```
 ```text
-test result: ok. 169 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.83s
+test result: ok. 196 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in ~55s
 ```
 
 ---

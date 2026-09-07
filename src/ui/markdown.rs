@@ -267,12 +267,7 @@ fn wrap_list_item(prefix_str: &str, text: &str, width: usize) -> Vec<Line<'stati
 }
 
 /// Wraps uniform styled text (such as headings)
-fn wrap_styled_text(
-    text: &str,
-    width: usize,
-    style: Style,
-    _indent: &str,
-) -> Vec<Line<'static>> {
+fn wrap_styled_text(text: &str, width: usize, style: Style, _indent: &str) -> Vec<Line<'static>> {
     let words: Vec<&str> = text.split_whitespace().collect();
     if words.is_empty() {
         return vec![Line::from(Span::styled(text.to_string(), style))];
@@ -286,7 +281,10 @@ fn wrap_styled_text(
         let word_w = word.width();
         if word_w > width {
             if !cur_line.is_empty() {
-                out.push(Line::from(Span::styled(std::mem::take(&mut cur_line), style)));
+                out.push(Line::from(Span::styled(
+                    std::mem::take(&mut cur_line),
+                    style,
+                )));
                 cur_w = 0;
             }
             let mut rem = word;

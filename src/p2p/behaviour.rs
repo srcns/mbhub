@@ -15,10 +15,10 @@
 //! - `mdns` — free peer discovery on the local network.
 //! - `limits` — connection budget against Sybil flooding.
 
+use libp2p::StreamProtocol;
 use libp2p::gossipsub::{self, MessageAuthenticity};
 use libp2p::identity::Keypair;
 use libp2p::swarm::NetworkBehaviour;
-use libp2p::StreamProtocol;
 
 use crate::p2p::protocol::MAX_GOSSIP_PAYLOAD;
 
@@ -77,11 +77,8 @@ impl MbHubBehaviour {
         .expect("valid gossipsub behaviour");
 
         let identify = libp2p::identify::Behaviour::new(
-            libp2p::identify::Config::new(
-                IDENTIFY_PROTOCOL_VERSION.to_string(),
-                keypair.public(),
-            )
-            .with_agent_version(format!("mbhub/{}", env!("CARGO_PKG_VERSION"))),
+            libp2p::identify::Config::new(IDENTIFY_PROTOCOL_VERSION.to_string(), keypair.public())
+                .with_agent_version(format!("mbhub/{}", env!("CARGO_PKG_VERSION"))),
         );
 
         let mut kad_config = libp2p::kad::Config::new(StreamProtocol::new(KAD_PROTOCOL_NAME));
@@ -100,11 +97,8 @@ impl MbHubBehaviour {
         let autonat = libp2p::autonat::Behaviour::new(peer_id, libp2p::autonat::Config::default());
         let dcutr = libp2p::dcutr::Behaviour::new(peer_id);
         let upnp = libp2p::upnp::tokio::Behaviour::default();
-        let mdns = libp2p::mdns::tokio::Behaviour::new(
-            libp2p::mdns::Config::default(),
-            peer_id,
-        )
-        .expect("valid mdns behaviour");
+        let mdns = libp2p::mdns::tokio::Behaviour::new(libp2p::mdns::Config::default(), peer_id)
+            .expect("valid mdns behaviour");
 
         Self {
             gossipsub,

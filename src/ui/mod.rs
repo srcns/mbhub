@@ -10,8 +10,8 @@ pub mod search;
 pub mod settings;
 pub mod viewer;
 
-use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout, Rect};
 
 use crate::app::{App, Screen};
 
@@ -54,8 +54,8 @@ pub fn render(frame: &mut Frame, app: &App) {
 /// Centered confirmation overlay for the viewer delete flow.
 fn draw_delete_prompt(frame: &mut Frame, area: Rect, prompt: &crate::app::DeletePrompt) {
     use ratatui::style::{Color, Style};
-    use ratatui::widgets::{Block, Borders, Clear, Paragraph};
     use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
     let height: u16 = if prompt.has_author { 8 } else { 7 };
     let width: u16 = 66.min(area.width.saturating_sub(4));

@@ -104,42 +104,58 @@ pub fn matches_query(query: &str, candidate_question: &str, min_similarity: f32)
         return false;
     }
 
-    // Short-query semantic guard:
-    // When queries have fewer than 8 words, common framing words ("What is the capital of...")
-    // dominate the 3-gram SimHash. We verify that substantive non-stopword tokens also match.
+    // Minimum-length floor (hardening): very short questions carry almost no
+    // shingle signal, so a crafted near-collision against a popular question
+    // is cheap to compute. Below the floor only an exact (normalized) match
+    // counts — short-question cache poisoning becomes structurally impossible.
+    if q_clean.chars().count() < 12 || c_clean.chars().count() < 12 {
+        return q_clean.to_lowercase() == c_clean.to_lowercase();
+    }
+
+    // Substantive-word semantic guard — now applied at EVERY length. The
+    // previous version skipped the check once both sides had 8+ words, which
+    // let an attacker pad a crafted question past the only semantic gate.
+    // Common framing words ("What is the capital of...") are ignored and at
+    // least 60% of the query's substantive words must appear in the candidate.
     let q_words: Vec<&str> = q_clean.split_whitespace().collect();
     let c_words: Vec<&str> = c_clean.split_whitespace().collect();
 
-    if q_words.len() < 8 || c_words.len() < 8 {
-        const STOP_WORDS: &[&str] = &[
-            "what", "is", "the", "of", "a", "an", "how", "to", "in", "on", "for", "and", "or",
-            "are", "do", "does", "did", "can", "could", "would", "should", "it", "at", "by",
-            "nedir", "nasil", "ne", "ve", "ile", "bir", "icin", "bu", "da", "de",
-        ];
+    const STOP_WORDS: &[&str] = &[
+        "what", "is", "the", "of", "a", "an", "how", "to", "in", "on", "for", "and", "or", "are",
+        "do", "does", "did", "can", "could", "would", "should", "it", "at", "by", "nedir", "nasil",
+        "ne", "ve", "ile", "bir", "icin", "bu", "da", "de",
+    ];
 
-        let q_substantive: Vec<String> = q_words
+    let q_substantive: Vec<String> = q_words
+        .iter()
+        .map(|w| {
+            w.to_lowercase()
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_string()
+        })
+        .filter(|w| !w.is_empty() && !STOP_WORDS.contains(&w.as_str()))
+        .collect();
+
+    let c_substantive: Vec<String> = c_words
+        .iter()
+        .map(|w| {
+            w.to_lowercase()
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_string()
+        })
+        .filter(|w| !w.is_empty() && !STOP_WORDS.contains(&w.as_str()))
+        .collect();
+
+    if !q_substantive.is_empty() && !c_substantive.is_empty() {
+        let matched_substantive = q_substantive
             .iter()
-            .map(|w| w.to_lowercase().trim_matches(|c: char| !c.is_alphanumeric()).to_string())
-            .filter(|w| !w.is_empty() && !STOP_WORDS.contains(&w.as_str()))
-            .collect();
+            .filter(|w| c_substantive.contains(w))
+            .count();
 
-        let c_substantive: Vec<String> = c_words
-            .iter()
-            .map(|w| w.to_lowercase().trim_matches(|c: char| !c.is_alphanumeric()).to_string())
-            .filter(|w| !w.is_empty() && !STOP_WORDS.contains(&w.as_str()))
-            .collect();
-
-        if !q_substantive.is_empty() && !c_substantive.is_empty() {
-            let matched_substantive = q_substantive
-                .iter()
-                .filter(|w| c_substantive.contains(w))
-                .count();
-
-            // At least 60% of query's substantive words must be present in candidate
-            let overlap = (matched_substantive as f32) / (q_substantive.len() as f32);
-            if overlap < 0.6 {
-                return false;
-            }
+        // At least 60% of query's substantive words must be present in candidate
+        let overlap = (matched_substantive as f32) / (q_substantive.len() as f32);
+        if overlap < 0.6 {
+            return false;
         }
     }
 
@@ -200,10 +216,7 @@ mod tests {
         let h1 = compute_simhash(q1);
         let h2 = compute_simhash(q2);
         let sim = similarity(h1, h2);
-        assert!(
-            sim < 70.0,
-            "expected low similarity < 70%, got {sim}%"
-        );
+        assert!(sim < 70.0, "expected low similarity < 70%, got {sim}%");
     }
 
     #[test]

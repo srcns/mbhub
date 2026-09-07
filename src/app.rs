@@ -10,8 +10,7 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::input::QueryInput;
 use crate::model::{
-    DateFormat, Freshness, HitRate, InferenceRecord, Settings, ShardingMode,
-    PROVIDERS,
+    DateFormat, Freshness, HitRate, InferenceRecord, PROVIDERS, Settings, ShardingMode,
 };
 use crate::ui::viewer::ViewerState;
 use crate::{db, theme};
@@ -568,7 +567,11 @@ impl App {
         if let Ok(models) = crate::api::client::fetch_models(provider.endpoint, key_opt) {
             if !models.is_empty() {
                 self.provider_models = models;
-                if !self.provider_models.iter().any(|m| m == &self.settings.provider_model) {
+                if !self
+                    .provider_models
+                    .iter()
+                    .any(|m| m == &self.settings.provider_model)
+                {
                     self.settings.provider_model = self.provider_models[0].clone();
                 }
                 return;
@@ -1073,10 +1076,7 @@ impl App {
         // (Memory/Ask/Settings) is never taken over.
         #[cfg(feature = "publisher")]
         {
-            let done = self
-                .pending_sync
-                .as_ref()
-                .and_then(|rx| rx.try_recv().ok());
+            let done = self.pending_sync.as_ref().and_then(|rx| rx.try_recv().ok());
             if let Some(outcome) = done {
                 self.pending_sync = None;
                 self.sync_status = Some(SyncStatus::Done {
@@ -1107,6 +1107,8 @@ impl App {
                             question: pending.question.clone(),
                             simhash: pending.simhash,
                             min_similarity: self.settings.hit_rate.percentage(),
+                            // Signed by the swarm loop before publication.
+                            signature: Vec::new(),
                         });
                     }
                     pending.broadcast_at = None;
@@ -1121,6 +1123,15 @@ impl App {
             if let Some(p2p) = &self.p2p {
                 while let Ok(resp) = p2p.query_response_rx.try_recv() {
                     if resp.request_id != pending.request_id {
+                        continue;
+                    }
+                    // Response binding (hardening): the answer must carry the
+                    // fingerprint of the question we actually asked — the same
+                    // check the headless path enforces. Without it, an
+                    // arbitrary attacker Q/A pair could be persisted under the
+                    // user's query hash at 100% similarity and re-served later
+                    // as a cache hit (audit: unbound poisoning amplifier).
+                    if resp.simhash != pending.simhash {
                         continue;
                     }
 
@@ -1162,7 +1173,10 @@ impl App {
                         continue;
                     };
                     self.insert_record(record.clone());
-                    let _ = db::enforce_storage_limit_gb(self.settings.reserved_gb, self.settings.sharding_mode == ShardingMode::QueryLocality);
+                    let _ = db::enforce_storage_limit_gb(
+                        self.settings.reserved_gb,
+                        self.settings.sharding_mode == ShardingMode::QueryLocality,
+                    );
 
                     let formatted = format!("# {}\n\n{}", resp.question, resp.content);
                     let date_str = self.settings.date_format.format(&record.ts);
@@ -1204,7 +1218,10 @@ impl App {
                             v.scroll_to_bottom(w, h);
                         }
                     }
-                    crate::api::stream::StreamMessage::Done { full_text, is_truncated } => {
+                    crate::api::stream::StreamMessage::Done {
+                        full_text,
+                        is_truncated,
+                    } => {
                         full_received = Some((full_text, is_truncated));
                         keep_streaming = false;
                         break;
@@ -1234,11 +1251,20 @@ impl App {
                         v.record = Some(record.clone());
                     }
                     self.insert_record(record);
-                    let _ = db::enforce_storage_limit_gb(self.settings.reserved_gb, self.settings.sharding_mode == ShardingMode::QueryLocality);
+                    let _ = db::enforce_storage_limit_gb(
+                        self.settings.reserved_gb,
+                        self.settings.sharding_mode == ShardingMode::QueryLocality,
+                    );
 
                     // P2P Gate: never gossip truncated inferences or inferences exceeding the 128 KB wire ceiling
                     if !is_truncated && full_text.len() <= crate::p2p::MAX_GOSSIP_PAYLOAD {
-                        self.publish_completed_inference(&stream.question, &full_text, stream.simhash, &stream.provider, &stream.model);
+                        self.publish_completed_inference(
+                            &stream.question,
+                            &full_text,
+                            stream.simhash,
+                            &stream.provider,
+                            &stream.model,
+                        );
                     }
                 }
             } else if let Some(err) = error_received {
@@ -1300,7 +1326,10 @@ impl App {
                 &msg.author_peer_id,
             ) {
                 self.insert_record(record);
-                let _ = db::enforce_storage_limit_gb(self.settings.reserved_gb, self.settings.sharding_mode == ShardingMode::QueryLocality);
+                let _ = db::enforce_storage_limit_gb(
+                    self.settings.reserved_gb,
+                    self.settings.sharding_mode == ShardingMode::QueryLocality,
+                );
             }
         }
 
@@ -1369,6 +1398,8 @@ impl App {
             hop_ttl: crate::p2p::MAX_HOP_TTL,
             is_truncated: false,
             pow: String::new(),
+            // Signed + PoW'd by the swarm loop before publication.
+            signature: Vec::new(),
             author_peer_id: String::new(),
         };
 
@@ -1432,7 +1463,8 @@ impl App {
             })
             .expect("failed to spawn safety classification thread");
 
-        self.pending_safety_checks.push(PendingSafetyCheck { msg, rx });
+        self.pending_safety_checks
+            .push(PendingSafetyCheck { msg, rx });
     }
 
     /// Collects stage-2 verdicts. Safe ⇒ publish; unsafe / error / disconnect
@@ -1595,7 +1627,9 @@ impl App {
         if api_key.trim().is_empty() {
             let msg = format!(
                 "# {}\n\n⚠️ **API Key Required**\n\nNo cached answer reached your Hit Rate threshold ({}), and no API key is configured for **{}**.\n\nPlease go to **SETTINGS > Cloud AI provider > API key** to configure your credentials.",
-                question, self.settings.hit_rate.label(), provider.name
+                question,
+                self.settings.hit_rate.label(),
+                provider.name
             );
             self.viewer = Some(ViewerState::new(msg));
             return;
@@ -1673,7 +1707,10 @@ impl App {
             KeyCode::Char('p') => {
                 if self.total_records > 0 && self.memory_selected < self.total_records {
                     if let Some(record) = self.get_memory_record(self.memory_selected) {
-                        let _ = crate::db::toggle_publish_candidate(&record.content_hash, &record.question);
+                        let _ = crate::db::toggle_publish_candidate(
+                            &record.content_hash,
+                            &record.question,
+                        );
                         self.reload_records();
                         self.scroll_into_view();
                         self.ensure_window();
@@ -1858,8 +1895,10 @@ impl App {
     fn begin_edit(&mut self) {
         match self.focus {
             SettingsField::DateFormat => {
-                let items: Vec<String> =
-                    DateFormat::ALL.iter().map(|d| d.label().to_string()).collect();
+                let items: Vec<String> = DateFormat::ALL
+                    .iter()
+                    .map(|d| d.label().to_string())
+                    .collect();
                 let selected = DateFormat::ALL
                     .iter()
                     .position(|d| *d == self.settings.date_format)
@@ -1872,8 +1911,10 @@ impl App {
                 ));
             }
             SettingsField::ShardingMode => {
-                let items: Vec<String> =
-                    ShardingMode::ALL.iter().map(|m| m.label().to_string()).collect();
+                let items: Vec<String> = ShardingMode::ALL
+                    .iter()
+                    .map(|m| m.label().to_string())
+                    .collect();
                 let selected = ShardingMode::ALL
                     .iter()
                     .position(|m| *m == self.settings.sharding_mode)
@@ -1900,8 +1941,10 @@ impl App {
                 ));
             }
             SettingsField::Freshness => {
-                let items: Vec<String> =
-                    Freshness::ALL.iter().map(|f| f.label().to_string()).collect();
+                let items: Vec<String> = Freshness::ALL
+                    .iter()
+                    .map(|f| f.label().to_string())
+                    .collect();
                 let selected = Freshness::ALL
                     .iter()
                     .position(|f| *f == self.settings.freshness)
@@ -1994,9 +2037,9 @@ impl App {
                     crate::tos::CURRENT_TOS_VERSION,
                 ));
             }
-    // Variants hidden from non-publisher builds resolve to no-op.
-    #[cfg(not(feature = "publisher"))]
-    _ => {}
+            // Variants hidden from non-publisher builds resolve to no-op.
+            #[cfg(not(feature = "publisher"))]
+            _ => {}
         }
     }
 
@@ -2130,7 +2173,7 @@ pub fn single_line(text: &str) -> TextArea<'static> {
 
 /// Random-ish 50-300 ms delay decorrelating consecutive outbound queries
 ///. No external RNG crate needed.
-fn query_jitter() -> Duration {
+pub(crate) fn query_jitter() -> Duration {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos() as u64)

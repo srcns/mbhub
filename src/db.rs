@@ -13,14 +13,17 @@
 //!    and position calculations while fetching slices lazily as the user scrolls.
 
 use chrono::{Datelike, Local, TimeZone, Timelike};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use crate::model::{InferenceRecord, Ts};
 use crate::seed::SEED_ENTRIES;
 
 /// Database path, overridable via `MBHUB_DB`.
 /// In unit tests, uses an isolated temporary database to prevent data poisoning.
-/// In production, uses `./mbhub.db` if present in cwd, or `~/.mbhub/mbhub.db`.
+/// In production, prefers `~/.mbhub/mbhub.db` — the canonical, owner-only
+/// location. A working-directory `mbhub.db` is honored ONLY when no home
+/// directory can be resolved: a repo-planted database must never hijack the
+/// node's memory (and the provider keys stored in its `meta` table).
 pub fn db_path() -> String {
     if let Ok(p) = std::env::var("MBHUB_DB") {
         return p;
@@ -33,13 +36,16 @@ pub fn db_path() -> String {
     }
     #[cfg(not(test))]
     {
-        if std::path::Path::new("mbhub.db").exists() {
-            return "mbhub.db".to_string();
-        }
-        if let Some(home) = std::env::var("HOME").ok().or_else(|| std::env::var("USERPROFILE").ok()) {
+        if let Some(home) = std::env::var("HOME")
+            .ok()
+            .or_else(|| std::env::var("USERPROFILE").ok())
+        {
             let dir = std::path::PathBuf::from(home).join(".mbhub");
             ensure_private_dir(&dir);
             return dir.join("mbhub.db").to_string_lossy().to_string();
+        }
+        if std::path::Path::new("mbhub.db").exists() {
+            return "mbhub.db".to_string();
         }
         "mbhub.db".to_string()
     }
@@ -648,7 +654,9 @@ pub fn save_inference(
     provider: &str,
     model: &str,
 ) -> Option<InferenceRecord> {
-    save_inference_internal(question, content, simhash, provider, model, None, false, false, "")
+    save_inference_internal(
+        question, content, simhash, provider, model, None, false, false, "",
+    )
 }
 
 pub fn save_inference_with_truncated(
@@ -659,7 +667,17 @@ pub fn save_inference_with_truncated(
     model: &str,
     is_truncated: bool,
 ) -> Option<InferenceRecord> {
-    save_inference_internal(question, content, simhash, provider, model, None, false, is_truncated, "")
+    save_inference_internal(
+        question,
+        content,
+        simhash,
+        provider,
+        model,
+        None,
+        false,
+        is_truncated,
+        "",
+    )
 }
 
 /// Checks whether a content hash is marked with a tombstone (negative signal).
@@ -735,10 +753,7 @@ fn prune_tombstones(conn: &Connection, max_rows: usize) {
 /// True when `hash` is a well-formed BLAKE3 content hash: exactly 64
 /// lowercase hex characters, as produced by `content_hash::compute_content_hash`.
 fn is_valid_content_hash(hash: &str) -> bool {
-    hash.len() == 64
-        && hash
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Bans a publisher on THIS node: every record they distributed is deleted
@@ -829,11 +844,9 @@ pub fn unban_author(peer_id: &str) -> bool {
 pub fn banned_count() -> usize {
     let conn = open();
     init(&conn);
-    conn.query_row("SELECT COUNT(*) FROM banned_peers", [], |r| {
-        r.get(0)
-    })
-    .map(|c: i64| c as usize)
-    .unwrap_or(0)
+    conn.query_row("SELECT COUNT(*) FROM banned_peers", [], |r| r.get(0))
+        .map(|c: i64| c as usize)
+        .unwrap_or(0)
 }
 
 /// Looks up the gossip-authenticated distributor of a stored record
@@ -1024,7 +1037,7 @@ fn save_inference_internal(
 
     let publish_candidate = if !is_swarm { 1 } else { 0 };
 
-    conn.execute(
+    if let Err(e) = conn.execute(
         "INSERT INTO inferences (timestamp, similarity, question, content, simhash, provider, model, content_hash, is_swarm, locality, is_truncated, publish_candidate, author_peer_id)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
@@ -1042,8 +1055,13 @@ fn save_inference_internal(
             publish_candidate,
             author_peer_id,
         ],
-    )
-    .expect("failed to insert new inference");
+    ) {
+        // Disk-full / SQLITE_BUSY (WAL contention with a concurrently running
+        // daemon) is reachable under a remote-driven write flood — a panic
+        // here would kill the daemon ingestion thread or crash the TUI.
+        eprintln!("[MBHub DB] inference insert failed: {e} — record dropped");
+        return None;
+    }
 
     Some(InferenceRecord {
         ts: from_unix(ts),
@@ -1204,21 +1222,41 @@ pub fn recompute_locality() {
 /// Finds the best matching candidate in local storage whose SimHash similarity meets
 /// or exceeds `min_similarity` percentage, using a precomputed 64-bit query SimHash.
 /// Uses streaming cursor evaluation to maintain constant O(1) memory overhead.
-pub fn find_best_match_by_hash(query_hash: u64, min_similarity: f32) -> Option<InferenceRecord> {
+/// Shared scan core behind the L1 and L2 lookups. `extra_where` is a fixed,
+/// internally-constructed SQL fragment (never user input); `recent_limit`
+/// optionally bounds the candidate window so a remote-driven scan stays
+/// O(window) instead of O(table).
+fn find_best_match_scan(
+    query_hash: u64,
+    min_similarity: f32,
+    extra_where: &str,
+    recent_limit: Option<i64>,
+) -> Option<InferenceRecord> {
     let conn = open();
     init(&conn);
 
-    let mut stmt = conn
-        .prepare(
+    let sql = match recent_limit {
+        Some(n) => format!(
             "SELECT timestamp, similarity, question, content, simhash, provider, model, content_hash, is_swarm, locality, is_truncated, publish_candidate
              FROM inferences
-             WHERE is_truncated = 0 AND NOT EXISTS (
+             WHERE is_truncated = 0 {extra_where} AND NOT EXISTS (
                  SELECT 1 FROM tombstones
                  WHERE tombstones.content_hash = inferences.content_hash AND inferences.content_hash != ''
              )
-             ORDER BY similarity DESC",
-        )
-        .ok()?;
+             ORDER BY timestamp DESC LIMIT {n}"
+        ),
+        None => format!(
+            "SELECT timestamp, similarity, question, content, simhash, provider, model, content_hash, is_swarm, locality, is_truncated, publish_candidate
+             FROM inferences
+             WHERE is_truncated = 0 {extra_where} AND NOT EXISTS (
+                 SELECT 1 FROM tombstones
+                 WHERE tombstones.content_hash = inferences.content_hash AND inferences.content_hash != ''
+             )
+             ORDER BY similarity DESC"
+        ),
+    };
+
+    let mut stmt = conn.prepare(&sql).ok()?;
 
     let rows = stmt
         .query_map([], |row| {
@@ -1275,6 +1313,29 @@ pub fn find_best_match_by_hash(query_hash: u64, min_similarity: f32) -> Option<I
     }
 
     best.map(|(_, r)| r)
+}
+
+/// L1 lookup (user's own ask): scans the full local shard, ranked by stored
+/// similarity. Local, user-initiated — no remote cost vector.
+pub fn find_best_match_by_hash(query_hash: u64, min_similarity: f32) -> Option<InferenceRecord> {
+    find_best_match_scan(query_hash, min_similarity, "", None)
+}
+
+/// L2 served lookup (answering OTHER peers' swarm queries): never serves
+/// swarm-sourced records and bounds the scan to the most recent window.
+///
+/// - `is_swarm = 0`: only content this node produced itself (local L3
+///   answers, which carry publish PoW) may be re-distributed. Serving
+///   swarm-sourced records would let zero-cost poisoned content propagate
+///   through this node to the rest of the mesh (audit: response-PoW bypass
+///   amplifier).
+/// - Recent window: a remote query must never drive a full-table sort on the
+///   single-threaded swarm loop (audit: remote CPU DoS).
+pub fn find_best_served_match_by_hash(
+    query_hash: u64,
+    min_similarity: f32,
+) -> Option<InferenceRecord> {
+    find_best_match_scan(query_hash, min_similarity, "AND is_swarm = 0", Some(500))
 }
 
 /// Finds the best matching candidate by query string.
@@ -1464,11 +1525,9 @@ pub fn find_best_match_query_fresh(
 pub fn get_meta(key: &str) -> Option<String> {
     let conn = open();
     init(&conn);
-    conn.query_row(
-        "SELECT val FROM meta WHERE key = ?1",
-        params![key],
-        |r| r.get::<_, String>(0),
-    )
+    conn.query_row("SELECT val FROM meta WHERE key = ?1", params![key], |r| {
+        r.get::<_, String>(0)
+    })
     .ok()
 }
 
@@ -1508,7 +1567,9 @@ pub fn load_provider_keys() -> std::collections::HashMap<String, String> {
     init(&conn);
     let mut map = std::collections::HashMap::new();
     if let Ok(mut stmt) = conn.prepare("SELECT key, val FROM meta WHERE key LIKE 'apikey:%'") {
-        if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
+        if let Ok(rows) =
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        {
             for (k, v) in rows.flatten() {
                 if let Some(prov) = k.strip_prefix("apikey:") {
                     map.insert(prov.to_string(), v);
@@ -1525,7 +1586,9 @@ pub fn load_provider_models() -> std::collections::HashMap<String, String> {
     init(&conn);
     let mut map = std::collections::HashMap::new();
     if let Ok(mut stmt) = conn.prepare("SELECT key, val FROM meta WHERE key LIKE 'model:%'") {
-        if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))) {
+        if let Ok(rows) =
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        {
             for (k, v) in rows.flatten() {
                 if let Some(prov) = k.strip_prefix("model:") {
                     map.insert(prov.to_string(), v);
@@ -1719,6 +1782,17 @@ fn sanitize_restored_rows(conn: &Connection) {
 /// Restores the current database from an existing backup at `src_path`.
 /// Returns the number of inference records restored.
 pub fn restore_from_file(src_path: &std::path::Path) -> Result<usize, rusqlite::Error> {
+    // Snapshot the LIVE meta table first: provider API keys, models and the
+    // terms-acceptance flag must survive a restore — a malicious backup must
+    // never be able to swap the user's credentials (audit: restore hijack).
+    let live_meta: Vec<(String, String)> = {
+        let conn = open();
+        init(&conn);
+        let mut stmt = conn.prepare("SELECT key, val FROM meta")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
     let src = Connection::open(src_path)?;
     let mut dst = open();
     {
@@ -1729,13 +1803,72 @@ pub fn restore_from_file(src_path: &std::path::Path) -> Result<usize, rusqlite::
     // Ensure schema migrations & indices are complete on the restored database
     init(&dst);
 
+    // Re-apply the LIVE meta over whatever the backup carried: the user's
+    // credentials and settings always win over a (potentially attacker-crafted)
+    // backup file.
+    {
+        let tx = dst.unchecked_transaction()?;
+        tx.execute("DELETE FROM meta", [])?;
+        for (k, v) in &live_meta {
+            tx.execute("INSERT INTO meta (key, val) VALUES (?1, ?2)", params![k, v])?;
+        }
+        tx.commit()?;
+    }
+
     // Post-restore hardening: sanitize + re-verify every restored row.
     sanitize_restored_rows(&dst);
+
+    // Content gates: a hand-crafted backup carries self-consistent (unkeyed)
+    // hashes that pass the integrity check by construction, so the content
+    // itself is gated exactly like inbound swarm content — DLP and the
+    // deterministic safety screen run before the restored rows become
+    // servable memory.
+    gate_restored_rows(&dst);
 
     let count: i64 = dst
         .query_row("SELECT COUNT(*) FROM inferences", [], |r| r.get(0))
         .unwrap_or(0);
     Ok(count as usize)
+}
+
+/// Runs the DLP scanner and the deterministic content-safety screen over every
+/// restored row and drops rows that the live ingest path would have rejected.
+fn gate_restored_rows(conn: &Connection) {
+    let tx = match conn.unchecked_transaction() {
+        Ok(tx) => tx,
+        Err(_) => return,
+    };
+
+    let mut drop_ids: Vec<i64> = Vec::new();
+    {
+        let mut stmt = match tx.prepare("SELECT id, question, content FROM inferences") {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        });
+        if let Ok(rows) = rows {
+            for row in rows.flatten() {
+                let (id, question, content) = row;
+                if crate::dlp::scan_text(&content).is_sensitive
+                    || crate::dlp::scan_text(&question).is_sensitive
+                    || !crate::content_safety::screen_text(&content).is_allowed()
+                {
+                    drop_ids.push(id);
+                }
+            }
+        }
+    }
+
+    for id in drop_ids {
+        let _ = tx.execute("DELETE FROM inferences WHERE id = ?1", params![id]);
+    }
+    let _ = tx.commit();
 }
 
 /// Enforces the user-configured fixed-GB local storage ceiling.
@@ -1749,7 +1882,9 @@ pub fn restore_from_file(src_path: &std::path::Path) -> Result<usize, rusqlite::
 ///
 /// Called after every write path and at startup. Returns the number of pruned rows.
 pub fn enforce_storage_limit_gb(max_gb: u64, locality_first: bool) -> u64 {
-    let cap_bytes = (max_gb as u64).saturating_mul(1_000_000_000).max(10_000_000);
+    let cap_bytes = (max_gb as u64)
+        .saturating_mul(1_000_000_000)
+        .max(10_000_000);
     enforce_storage_limit_bytes(cap_bytes, locality_first)
 }
 
@@ -1801,7 +1936,9 @@ pub fn enforce_storage_limit_bytes(max_bytes: u64, locality_first: bool) -> u64 
             break;
         }
         let rows: u64 = conn
-            .query_row("SELECT COUNT(*) FROM inferences", [], |r| r.get::<_, i64>(0))
+            .query_row("SELECT COUNT(*) FROM inferences", [], |r| {
+                r.get::<_, i64>(0)
+            })
             .unwrap_or(0) as u64;
         if rows == 0 {
             break;
@@ -1811,7 +1948,10 @@ pub fn enforce_storage_limit_bytes(max_bytes: u64, locality_first: bool) -> u64 
         // the file lands at ~90% of the cap; add slack for size variance.
         let avg = (size / rows).max(1);
         let keep_target = ((max_bytes as f64 * 0.9) / avg as f64).floor() as u64;
-        let to_delete = rows.saturating_sub(keep_target).saturating_add(10).min(rows);
+        let to_delete = rows
+            .saturating_sub(keep_target)
+            .saturating_add(10)
+            .min(rows);
 
         if to_delete == 0 {
             break;
@@ -1850,7 +1990,9 @@ fn file_size(path: &std::path::Path) -> u64 {
 }
 
 fn seed(conn: &Connection) -> usize {
-    let tx = conn.unchecked_transaction().expect("failed to begin seed tx");
+    let tx = conn
+        .unchecked_transaction()
+        .expect("failed to begin seed tx");
     tx.execute("DELETE FROM inferences", [])
         .expect("failed to clear inferences");
     {
@@ -1863,8 +2005,16 @@ fn seed(conn: &Connection) -> usize {
             let ts = base - (i as i64) * 39_600 - ((i * 37) % 5400) as i64;
             let sim = 1.0 + (pseudo(i as u32) % 98_999) as f64 / 1000.0;
             let simhash = crate::simhash::compute_simhash(&entry.question);
-            stmt.execute(params![ts, sim, entry.question, entry.content, simhash as i64, "OpenAI", "gpt-4o"])
-                .expect("failed to insert seed row");
+            stmt.execute(params![
+                ts,
+                sim,
+                entry.question,
+                entry.content,
+                simhash as i64,
+                "OpenAI",
+                "gpt-4o"
+            ])
+            .expect("failed to insert seed row");
         }
     }
     tx.commit().expect("failed to commit seed tx");
@@ -2040,8 +2190,13 @@ mod tests {
 
     /// Serializes DB tests against every other DB-touching test: MBHUB_DB
     /// is process-wide env state, and cargo runs tests in parallel threads.
-    fn lock_db() -> (std::sync::MutexGuard<'static, ()>, std::sync::MutexGuard<'static, ()>) {
-        let guard_env = crate::env::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    fn lock_db() -> (
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let guard_env = crate::env::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let guard_db = DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("MBHUB_DB", "mbhub_test.db");
@@ -2079,21 +2234,23 @@ mod tests {
         assert_eq!(count_records(), 0, "records from banned author removed");
 
         // Re-entry blocked: the same publisher cannot save again.
-        assert!(save_swarm_inference(
-            "Second attempt from banned author?",
-            "Second attempt content with enough length to pass gates.",
-            crate::simhash::compute_simhash("Second attempt from banned author?"),
-            "OpenAI",
-            "gpt-4o",
-            &crate::content_hash::compute_content_hash(
+        assert!(
+            save_swarm_inference(
                 "Second attempt from banned author?",
                 "Second attempt content with enough length to pass gates.",
+                crate::simhash::compute_simhash("Second attempt from banned author?"),
                 "OpenAI",
                 "gpt-4o",
-            ),
-            author,
-        )
-        .is_none());
+                &crate::content_hash::compute_content_hash(
+                    "Second attempt from banned author?",
+                    "Second attempt content with enough length to pass gates.",
+                    "OpenAI",
+                    "gpt-4o",
+                ),
+                author,
+            )
+            .is_none()
+        );
 
         // Ban list + unban lifecycle.
         assert_eq!(banned_count(), 1);
@@ -2130,7 +2287,10 @@ mod tests {
 
         // Author retraction gate: only the stored distributor matches.
         assert!(record_author_matches(&hash, author));
-        assert!(!record_author_matches(&hash, "12D3KooWSomeoneElse____________________9999"));
+        assert!(!record_author_matches(
+            &hash,
+            "12D3KooWSomeoneElse____________________9999"
+        ));
         assert!(!record_author_matches("f".repeat(64).as_str(), author));
         assert!(!record_author_matches("", author));
 
@@ -2203,8 +2363,14 @@ mod tests {
     fn content_hash_format_validation() {
         assert!(is_valid_content_hash(&"a".repeat(64)));
         assert!(!is_valid_content_hash(""));
-        assert!(!is_valid_content_hash(&"A".repeat(64)), "uppercase hex rejected");
-        assert!(!is_valid_content_hash(&"a".repeat(63)), "too short rejected");
+        assert!(
+            !is_valid_content_hash(&"A".repeat(64)),
+            "uppercase hex rejected"
+        );
+        assert!(
+            !is_valid_content_hash(&"a".repeat(63)),
+            "too short rejected"
+        );
         assert!(!is_valid_content_hash(&"a".repeat(65)), "too long rejected");
         assert!(!is_valid_content_hash(&"g".repeat(64)), "non-hex rejected");
         assert!(!is_valid_content_hash("deadbeef"));
@@ -2221,16 +2387,27 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode(&test_db.path), 0o600, "database file must be owner-only");
+            let mode =
+                |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode(&test_db.path),
+                0o600,
+                "database file must be owner-only"
+            );
 
             // A drifted (or pre-existing) file is repaired on the next open.
-            std::fs::set_permissions(&test_db.path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            std::fs::set_permissions(&test_db.path, std::fs::Permissions::from_mode(0o644))
+                .unwrap();
             let _conn2 = open();
-            assert_eq!(mode(&test_db.path), 0o600, "open() must repair drifted permissions");
+            assert_eq!(
+                mode(&test_db.path),
+                0o600,
+                "open() must repair drifted permissions"
+            );
 
             // The ~/.mbhub data directory is created and kept owner-only.
-            let dir = std::env::temp_dir().join(format!("mbhub_dbsec_dir_test_{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("mbhub_dbsec_dir_test_{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             ensure_private_dir(&dir);
             assert_eq!(mode(&dir), 0o700, "data directory must be owner-only");
@@ -2241,7 +2418,8 @@ mod tests {
         }
 
         // Backup output is owner-only too (it contains plaintext API keys).
-        let dest = std::env::temp_dir().join(format!("mbhub_dbsec_backup_test_{}.db", std::process::id()));
+        let dest =
+            std::env::temp_dir().join(format!("mbhub_dbsec_backup_test_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&dest);
         backup_to_file(&dest).expect("backup succeeds");
         #[cfg(unix)]
@@ -2262,8 +2440,10 @@ mod tests {
     #[test]
     fn restore_sanitizes_and_rejects_unverified_rows() {
         // Build a crafted "backup" containing clean, malicious and tampered rows.
-        let src_path =
-            std::env::temp_dir().join(format!("mbhub_dbsec_restore_src_{}.sqlite", std::process::id()));
+        let src_path = std::env::temp_dir().join(format!(
+            "mbhub_dbsec_restore_src_{}.sqlite",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&src_path);
         {
             let src = Connection::open(&src_path).unwrap();
@@ -2290,10 +2470,18 @@ mod tests {
                 "gpt-4o",
             );
             for (q, c, hash) in [
-                ("What is Rust?", "A systems programming language.", good_hash.as_str()),
+                (
+                    "What is Rust?",
+                    "A systems programming language.",
+                    good_hash.as_str(),
+                ),
                 ("Escape attempt", esc_content, attacker_hash.as_str()),
                 ("Bad hash row", "Valid answer body.", "deadbeef"),
-                ("Rewrite \x1b[31mme", "Body with \x1b[2Jclear", rewrite_hash.as_str()),
+                (
+                    "Rewrite \x1b[31mme",
+                    "Body with \x1b[2Jclear",
+                    rewrite_hash.as_str(),
+                ),
             ] {
                 src.execute(
                     "INSERT INTO inferences (timestamp, similarity, question, content, simhash, provider, model, content_hash)
@@ -2369,7 +2557,10 @@ mod tests {
         assert_eq!(count, 5, "cap must prune the oldest entries");
         // Same-second inserts are pruned in insertion order: oldest first.
         for i in 0..3u64 {
-            assert!(!is_tombstoned(&format!("{i:064x}")), "oldest entry {i} pruned");
+            assert!(
+                !is_tombstoned(&format!("{i:064x}")),
+                "oldest entry {i} pruned"
+            );
         }
         for i in 3..8u64 {
             assert!(is_tombstoned(&format!("{i:064x}")), "newest entry {i} kept");

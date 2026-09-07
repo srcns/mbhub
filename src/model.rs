@@ -39,16 +39,28 @@ impl DateFormat {
     pub fn format(self, t: &Ts) -> String {
         match self {
             DateFormat::DotDmy => {
-                format!("{:02}.{:02}.{} {:02}:{:02}", t.day, t.month, t.year, t.hour, t.minute)
+                format!(
+                    "{:02}.{:02}.{} {:02}:{:02}",
+                    t.day, t.month, t.year, t.hour, t.minute
+                )
             }
             DateFormat::IsoDash => {
-                format!("{}-{:02}-{:02} {:02}:{:02}", t.year, t.month, t.day, t.hour, t.minute)
+                format!(
+                    "{}-{:02}-{:02} {:02}:{:02}",
+                    t.year, t.month, t.day, t.hour, t.minute
+                )
             }
             DateFormat::SlashMdy => {
-                format!("{:02}/{:02}/{} {:02}:{:02}", t.month, t.day, t.year, t.hour, t.minute)
+                format!(
+                    "{:02}/{:02}/{} {:02}:{:02}",
+                    t.month, t.day, t.year, t.hour, t.minute
+                )
             }
             DateFormat::SlashYmd => {
-                format!("{}/{:02}/{:02} {:02}:{:02}", t.year, t.month, t.day, t.hour, t.minute)
+                format!(
+                    "{}/{:02}/{:02} {:02}:{:02}",
+                    t.year, t.month, t.day, t.hour, t.minute
+                )
             }
         }
     }
@@ -201,7 +213,8 @@ impl Freshness {
     /// Calculates the minimum unix epoch timestamp for this freshness setting.
     #[allow(dead_code)]
     pub fn min_timestamp(self, current_epoch: i64) -> Option<i64> {
-        self.duration_seconds().map(|dur| current_epoch.saturating_sub(dur))
+        self.duration_seconds()
+            .map(|dur| current_epoch.saturating_sub(dur))
     }
 }
 
@@ -213,10 +226,7 @@ pub enum ShardingMode {
 }
 
 impl ShardingMode {
-    pub const ALL: [ShardingMode; 2] = [
-        ShardingMode::QueryLocality,
-        ShardingMode::BlindSwarm,
-    ];
+    pub const ALL: [ShardingMode; 2] = [ShardingMode::QueryLocality, ShardingMode::BlindSwarm];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -291,13 +301,8 @@ impl HitRate {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum InferenceSource {
-    CloudProvider {
-        provider: String,
-        model: String,
-    },
-    SwarmPeer {
-        peer_id: String,
-    },
+    CloudProvider { provider: String, model: String },
+    SwarmPeer { peer_id: String },
 }
 
 impl InferenceSource {
@@ -359,7 +364,8 @@ impl Settings {
             }
             if let Some(model) = crate::env::get_model_for_provider(provider.name) {
                 if !model.is_empty() {
-                    s.provider_selected_models.insert(provider.name.to_string(), model);
+                    s.provider_selected_models
+                        .insert(provider.name.to_string(), model);
                 }
             }
         }

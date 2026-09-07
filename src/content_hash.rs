@@ -14,12 +14,7 @@
 ///
 /// Fields are separated by null bytes (`\x00`) to prevent ambiguity between
 /// field boundaries (e.g., `("ab", "cd")` vs `("a", "bcd")`).
-pub fn compute_content_hash(
-    question: &str,
-    content: &str,
-    provider: &str,
-    model: &str,
-) -> String {
+pub fn compute_content_hash(question: &str, content: &str, provider: &str, model: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(question.as_bytes());
     hasher.update(b"\x00");
@@ -79,8 +74,7 @@ mod tests {
 
     #[test]
     fn verify_roundtrip() {
-        let hash =
-            compute_content_hash("Question?", "Answer.", "Gemini", "gemini-2.5-pro");
+        let hash = compute_content_hash("Question?", "Answer.", "Gemini", "gemini-2.5-pro");
         assert!(verify_content_hash(
             &hash,
             "Question?",
@@ -92,8 +86,7 @@ mod tests {
 
     #[test]
     fn verify_detects_tampering() {
-        let hash =
-            compute_content_hash("Question?", "Answer.", "Gemini", "gemini-2.5-pro");
+        let hash = compute_content_hash("Question?", "Answer.", "Gemini", "gemini-2.5-pro");
         // Tamper with content
         assert!(!verify_content_hash(
             &hash,

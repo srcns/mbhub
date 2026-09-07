@@ -8,19 +8,33 @@
 //! - `mbhub daemon` (Background IPC Service)
 //! - `mbhub mcp` (Model Context Protocol server)
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::ipc::IpcResponse;
-use crate::model::{Settings, PROVIDERS};
-use crate::p2p::protocol::{SwarmInferenceMessage, SwarmQueryRequest};
+use crate::model::{PROVIDERS, Settings, ShardingMode};
 use crate::p2p::P2pHandle;
+use crate::p2p::protocol::{SwarmInferenceMessage, SwarmQueryRequest};
+
+/// Headless callers (CLI / IPC / MCP) previously had no length bound — the
+/// 80-character atomic-query cap was TUI-only — so a multi-megabyte query
+/// could inflate every peer's database and broadcast private context to the
+/// swarm. A generous ceiling keeps every legitimate use comfortable.
+const MAX_QUERY_BYTES: usize = 512;
 
 /// Executes an atomic ask query through the full 3-layer pipeline.
 pub fn execute_ask(query: &str, p2p: Option<&P2pHandle>) -> Result<IpcResponse, String> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return Err("Query cannot be empty.".to_string());
+    }
+    if trimmed.len() > MAX_QUERY_BYTES {
+        return Err(format!(
+            "Query too long: {} bytes (atomic queries are capped at {MAX_QUERY_BYTES}).",
+            trimmed.len()
+        ));
     }
 
     // Gate 1: DLP Pre-Flight Gate
@@ -61,13 +75,21 @@ pub fn execute_ask(query: &str, p2p: Option<&P2pHandle>) -> Result<IpcResponse, 
     // Gate 3: L2 P2P Swarm Lookup (if peers are connected)
     if let Some(p) = p2p {
         if p.connected_peers() > 0 {
-            let request_id = format!(
-                "{:x}",
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            );
+            // Random request id (std RandomState is OS-seeded): the old
+            // nanosecond timestamp embedded the exact ask time into the
+            // public gossip payload, a timing-correlation leak.
+            let request_id = {
+                let mut h = RandomState::new().build_hasher();
+                h.write_u64(q_simhash);
+                h.write_u64(chrono::Local::now().timestamp_millis() as u64);
+                format!("{:016x}", h.finish())
+            };
+
+            // Query jitter: the TUI path decorrelated outbound queries with a
+            // 50-300 ms hold; the daemon/CLI/MCP path broadcast instantly,
+            // making consecutive asks perfectly time-correlatable to any
+            // gossip observer. Apply the same jitter for every caller.
+            thread::sleep(crate::app::query_jitter());
 
             p.broadcast_query(SwarmQueryRequest {
                 request_id: request_id.clone(),
@@ -75,6 +97,8 @@ pub fn execute_ask(query: &str, p2p: Option<&P2pHandle>) -> Result<IpcResponse, 
                 question: trimmed.to_string(),
                 simhash: q_simhash,
                 min_similarity: min_sim,
+                // Signed by the swarm loop before publication.
+                signature: Vec::new(),
             });
 
             // Wait up to 2.5 s for a swarm response. GossipSub mesh
@@ -93,13 +117,11 @@ pub fn execute_ask(query: &str, p2p: Option<&P2pHandle>) -> Result<IpcResponse, 
                         {
                             continue;
                         }
-                        let is_honest = resp.simhash == q_simhash
-                            && resp.passes_integrity_checks();
+                        let is_honest = resp.simhash == q_simhash && resp.passes_integrity_checks();
 
                         if is_honest {
                             let inbound_dlp = crate::dlp::scan_text(&resp.content);
-                            let inbound_safety =
-                                crate::content_safety::screen_text(&resp.content);
+                            let inbound_safety = crate::content_safety::screen_text(&resp.content);
 
                             if !inbound_dlp.is_sensitive
                                 && inbound_safety.is_allowed()
@@ -169,7 +191,10 @@ pub fn execute_ask(query: &str, p2p: Option<&P2pHandle>) -> Result<IpcResponse, 
             Ok(crate::api::stream::StreamMessage::Token(token)) => {
                 full_response.push_str(&token);
             }
-            Ok(crate::api::stream::StreamMessage::Done { full_text, is_truncated }) => {
+            Ok(crate::api::stream::StreamMessage::Done {
+                full_text,
+                is_truncated,
+            }) => {
                 full_response = full_text;
                 is_stream_truncated = is_truncated;
                 break;
@@ -197,16 +222,17 @@ pub fn execute_ask(query: &str, p2p: Option<&P2pHandle>) -> Result<IpcResponse, 
     // hashing, storing, broadcasting, and returning the provider output so
     // every downstream consumer (DB, P2P peers, terminal) sees the same
     // canonical text.
-    let redacted_response = crate::sanitize::strip_control_chars(&crate::dlp::redact_secrets(
-        &full_response,
-    ));
+    let redacted_response =
+        crate::sanitize::strip_control_chars(&crate::dlp::redact_secrets(&full_response));
     if redacted_response.trim().is_empty() || redacted_response.trim().len() < 10 {
-        return Err("AI Provider Error: Model returned an empty or insufficient response.".to_string());
+        return Err(
+            "AI Provider Error: Model returned an empty or insufficient response.".to_string(),
+        );
     }
 
     let now_ts = chrono::Local::now().timestamp();
 
-    // Save inference locally (unlimited size, records whether it was truncated)
+    // Save inference locally (records whether it was truncated)
     if crate::db::save_inference_with_truncated(
         trimmed,
         &redacted_response,
@@ -214,9 +240,22 @@ pub fn execute_ask(query: &str, p2p: Option<&P2pHandle>) -> Result<IpcResponse, 
         provider.name,
         &model,
         is_stream_truncated,
-    ).is_none() {
-        return Err("Security Gate Error: Response rejected by database security gate.".to_string());
+    )
+    .is_none()
+    {
+        return Err(
+            "Security Gate Error: Response rejected by database security gate.".to_string(),
+        );
     }
+
+    // Storage quota: headless writes previously bypassed eviction entirely
+    // (the daemon enforced the ceiling only at startup), letting CLI/IPC/MCP
+    // traffic grow the store without bound. Cheap call — early-returns while
+    // under the cap.
+    let _ = crate::db::enforce_storage_limit_gb(
+        settings.reserved_gb,
+        settings.sharding_mode == ShardingMode::QueryLocality,
+    );
 
     // Broadcast to swarm if connected AND not truncated AND passing anti-poison gate AND within 128 KB wire ceiling
     if let Some(p) = p2p {
@@ -245,6 +284,8 @@ pub fn execute_ask(query: &str, p2p: Option<&P2pHandle>) -> Result<IpcResponse, 
                 hop_ttl: 8,
                 is_truncated: false,
                 pow: String::new(),
+                // Signed + PoW'd by the swarm loop before publication.
+                signature: Vec::new(),
                 author_peer_id: String::new(),
             };
 

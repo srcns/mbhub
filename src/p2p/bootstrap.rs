@@ -85,7 +85,11 @@ pub fn cache_path() -> Option<PathBuf> {
     let home = std::env::var("HOME")
         .ok()
         .or_else(|| std::env::var("USERPROFILE").ok())?;
-    Some(PathBuf::from(home).join(".mbhub").join("bootstrap-cache.json"))
+    Some(
+        PathBuf::from(home)
+            .join(".mbhub")
+            .join("bootstrap-cache.json"),
+    )
 }
 
 /// Parses a comma/newline separated multiaddr list, deduplicating and capping.
@@ -155,11 +159,7 @@ fn fetch_remote_peers() -> Option<Vec<Multiaddr>> {
         }
     }
     let peers = parse_multiaddr_list(&raws);
-    if peers.is_empty() {
-        None
-    } else {
-        Some(peers)
-    }
+    if peers.is_empty() { None } else { Some(peers) }
 }
 
 /// Writes the cache file atomically with owner-only permissions.
@@ -174,7 +174,8 @@ fn write_cache(addresses: &[Multiaddr]) {
         }
     }
     let list: Vec<String> = addresses.iter().map(|a| a.to_string()).collect();
-    let json = serde_json::json!({ "bootstraps": list, "saved_at": chrono::Local::now().to_rfc3339() });
+    let json =
+        serde_json::json!({ "bootstraps": list, "saved_at": chrono::Local::now().to_rfc3339() });
     if let Ok(bytes) = serde_json::to_vec_pretty(&json) {
         let tmp = path.with_extension("tmp");
         if std::fs::OpenOptions::new()

@@ -131,14 +131,8 @@ pub fn default_models_for_provider(provider_name: &str) -> Vec<String> {
             "gemini-1.5-pro".to_string(),
             "gemini-1.5-flash".to_string(),
         ],
-        "DeepSeek" => vec![
-            "deepseek-chat".to_string(),
-            "deepseek-reasoner".to_string(),
-        ],
-        "xAI (Grok)" => vec![
-            "grok-2-latest".to_string(),
-            "grok-beta".to_string(),
-        ],
+        "DeepSeek" => vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()],
+        "xAI (Grok)" => vec!["grok-2-latest".to_string(), "grok-beta".to_string()],
         "OpenRouter" => vec![
             "anthropic/claude-3.7-sonnet".to_string(),
             "deepseek/deepseek-r1".to_string(),
@@ -349,7 +343,10 @@ mod tests {
         ];
         let filtered = filter_text_models(&input);
         assert_eq!(filtered.len(), 2);
-        assert!(!filtered[1].contains('\x1b'), "remote model IDs must be sanitized");
+        assert!(
+            !filtered[1].contains('\x1b'),
+            "remote model IDs must be sanitized"
+        );
         assert!(!filtered[1].contains("bWFsaWNpb3Vz"));
     }
 

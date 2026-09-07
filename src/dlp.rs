@@ -37,11 +37,37 @@ impl DlpScanResult {
 
 // ── Compiled pattern set (compiled once, reused across calls) ──
 
+// `sk-` followed by 20+ key characters INCLUDING internal dashes, so modern
+// OpenAI project keys (`sk-proj-…`, `sk-svcacct-…`) are matched — the earlier
+// `[A-Za-z0-9]{20,}` class broke at the dash inside `sk-proj-` and let the
+// default key format issued since 2023 pass unredacted.
 static RE_OPENAI_KEY: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"sk-[A-Za-z0-9]{20,}").unwrap());
+    LazyLock::new(|| Regex::new(r"sk-[A-Za-z0-9_-]{20,}").unwrap());
 
 static RE_ANTHROPIC_KEY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"sk-ant-[A-Za-z0-9\-]{20,}").unwrap());
+
+// Provider-specific key shapes for the providers MBHub itself ships with.
+static RE_GOOGLE_KEY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"AIza[0-9A-Za-z_\-]{35}").unwrap());
+
+static RE_GITHUB_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})").unwrap()
+});
+
+static RE_GROQ_KEY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"gsk_[A-Za-z0-9]{20,}").unwrap());
+
+static RE_PERPLEXITY_KEY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"pplx-[A-Za-z0-9]{20,}").unwrap());
+
+static RE_XAI_KEY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"xai-[A-Za-z0-9]{20,}").unwrap());
+
+static RE_SLACK_TOKEN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"xox[baprs]-[A-Za-z0-9\-]{10,}").unwrap());
+
+static RE_STRIPE_KEY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[sr]k_live_[A-Za-z0-9]{20,}").unwrap());
 
 static RE_GENERIC_API_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(api[_-]?key|secret[_-]?key|access[_-]?token|bearer)\s*[=:]\s*['"]?[A-Za-z0-9_\-]{20,}"#)
@@ -68,6 +94,13 @@ static PATTERNS: LazyLock<Vec<(&'static Regex, &'static str)>> = LazyLock::new(|
     vec![
         (&*RE_ANTHROPIC_KEY, "Anthropic API Key"),
         (&*RE_OPENAI_KEY, "API Key (OpenAI / Generic)"),
+        (&*RE_GOOGLE_KEY, "Google API Key"),
+        (&*RE_GITHUB_TOKEN, "GitHub Token"),
+        (&*RE_GROQ_KEY, "Groq API Key"),
+        (&*RE_PERPLEXITY_KEY, "Perplexity API Key"),
+        (&*RE_XAI_KEY, "xAI API Key"),
+        (&*RE_SLACK_TOKEN, "Slack Token"),
+        (&*RE_STRIPE_KEY, "Stripe Live Key"),
         (&*RE_AWS_ACCESS_KEY, "AWS Access Key"),
         (&*RE_JWT, "JWT Token"),
         (&*RE_PRIVATE_KEY_BLOCK, "Private Key Block"),
@@ -174,10 +207,7 @@ mod tests {
         let input = "my key is sk-proj1234567890abcdefghij";
         let result = scan_text(input);
         assert!(result.is_sensitive);
-        assert_eq!(
-            result.matched_pattern,
-            Some("API Key (OpenAI / Generic)")
-        );
+        assert_eq!(result.matched_pattern, Some("API Key (OpenAI / Generic)"));
     }
 
     #[test]
@@ -189,9 +219,44 @@ mod tests {
     }
 
     #[test]
+    fn detects_modern_openai_project_key() {
+        // The dash inside `sk-proj-` must not break the pattern (regression:
+        // the pre-hardening class `[A-Za-z0-9]{20,}` missed this exact shape).
+        let input = "key sk-proj-Ab12Cd34Ef56Gh78Ij90Kl12Mn34 real";
+        let result = scan_text(input);
+        assert!(result.is_sensitive);
+        assert_eq!(result.matched_pattern, Some("API Key (OpenAI / Generic)"));
+    }
+
+    #[test]
+    fn detects_provider_key_shapes() {
+        for (input, label) in [
+            ("AIzaSyA1234567890abcdefghijklmnopqrstuvw", "Google API Key"),
+            ("ghp_0123456789abcdefghijklmnopqrstuvwxyzAB", "GitHub Token"),
+            ("gsk_0123456789abcdefghijklmnopqrstuv", "Groq API Key"),
+            (
+                "pplx-0123456789abcdefghijklmnopqrstuv",
+                "Perplexity API Key",
+            ),
+            ("xai-0123456789abcdefghijklmnopqrstuvwx", "xAI API Key"),
+        ] {
+            let result = scan_text(input);
+            assert!(result.is_sensitive, "must detect {input}");
+            assert_eq!(result.matched_pattern, Some(label), "for {input}");
+        }
+    }
+
+    #[test]
+    fn redacts_modern_openai_project_key() {
+        let input = "echo sk-proj-Ab12Cd34Ef56Gh78Ij90Kl12Mn34 back";
+        let redacted = redact_secrets(input);
+        assert!(redacted.contains("[REDACTED_API Key (OpenAI / Generic)]"));
+        assert!(!redacted.contains("Ab12Cd34"));
+    }
+
+    #[test]
     fn detects_jwt_token() {
-        let input =
-            "token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+        let input = "token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
         let result = scan_text(input);
         assert!(result.is_sensitive);
         assert_eq!(result.matched_pattern, Some("JWT Token"));
@@ -235,10 +300,7 @@ mod tests {
         let input = "api_key = 'abcdefghijklmnopqrstuvwxyz12'";
         let result = scan_text(input);
         assert!(result.is_sensitive);
-        assert_eq!(
-            result.matched_pattern,
-            Some("API Key / Secret Token")
-        );
+        assert_eq!(result.matched_pattern, Some("API Key / Secret Token"));
     }
 
     #[test]

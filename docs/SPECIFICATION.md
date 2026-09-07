@@ -236,7 +236,7 @@ Within 3–5 seconds, the top status bar on both nodes displays `PEERS: 1`, and 
 
 ## 8. Verification & Automated Test Suite
 
-MBHub is verified with **169 passing automated tests**:
+MBHub is verified with **196 passing automated tests**:
 
 * **Unit Tests:** DLP redaction, ANSI terminal sanitization, BLAKE3 content-hashing, SimHash Hamming distances, Ed25519 identity key generation and repair.
 * **Integration Tests:** Pipeline routing (L1 $\rightarrow$ L2 $\rightarrow$ L3), wire integrity gates, anti-poison filters, replay deduplication, and storage quota enforcement.

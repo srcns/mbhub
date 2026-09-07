@@ -1,11 +1,11 @@
 //! Settings screen. Flat BIOS-like list with clear, uncluttered typography,
 //! dynamic model discovery visibility, hierarchical categories, and modal selection pickers.
 
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::Frame;
 
 use crate::app::{App, PickerModal, SettingsField};
 use crate::model::PROVIDERS;
@@ -311,7 +311,11 @@ fn draw_picker_modal(frame: &mut Frame, area: Rect, picker: &PickerModal) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        .border_style(
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
         .title(format!(" {} ({} items) ", picker.title, picker.items.len()))
         .title_alignment(Alignment::Center);
 
@@ -333,13 +337,20 @@ fn draw_picker_modal(frame: &mut Frame, area: Rect, picker: &PickerModal) {
         let item = &picker.items[i];
         let is_selected = i == picker.selected;
         let style = if is_selected {
-            Style::default().bg(Color::White).fg(Color::Black).add_modifier(Modifier::BOLD)
+            Style::default()
+                .bg(Color::White)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
         };
 
         let prefix = if is_selected { " ► " } else { "   " };
-        let text = format!("{prefix}{:<width$}", item, width = (inner.width as usize).saturating_sub(4));
+        let text = format!(
+            "{prefix}{:<width$}",
+            item,
+            width = (inner.width as usize).saturating_sub(4)
+        );
         lines.push(Line::from(Span::styled(text, style)));
     }
 
@@ -400,10 +411,7 @@ fn draw_help_box(
     frame.render_widget(Paragraph::new(visible), area);
 }
 
-fn field_help(
-    field: SettingsField,
-    editing: bool,
-) -> (&'static str, &'static str, &'static str) {
+fn field_help(field: SettingsField, editing: bool) -> (&'static str, &'static str, &'static str) {
     match field {
         SettingsField::DateFormat => (
             "Date format",
@@ -417,7 +425,11 @@ fn field_help(
             } else {
                 "Local disk budget for your node's live shard (default 1 GB). Every verified answer is stored until this quota fills up — relevance is NOT filtered at storage time. When the quota overflows, Query locality keeps the records most similar to your past questions and evicts the least relevant; Blind swarm evicts the oldest."
             },
-            if editing { "Enter: save quota · Backspace: edit" } else { "Enter: edit storage quota" },
+            if editing {
+                "Enter: save quota · Backspace: edit"
+            } else {
+                "Enter: edit storage quota"
+            },
         ),
         SettingsField::ShardingMode => (
             "Sharding mode",
@@ -451,7 +463,11 @@ fn field_help(
             } else {
                 "Secret API key for the selected cloud AI provider. Stored locally on your machine and used to query live models."
             },
-            if editing { "Enter: save & validate key" } else { "Enter: edit API key" },
+            if editing {
+                "Enter: save & validate key"
+            } else {
+                "Enter: edit API key"
+            },
         ),
         SettingsField::BackupDatabase => (
             "Backup database (Export)",
@@ -531,17 +547,14 @@ fn wrap_description(text: &str, width: usize) -> Vec<String> {
 }
 
 /// A normal (non-editing) field: label column + plain value.
-fn row(
-    frame: &mut Frame,
-    area: Rect,
-    label: &str,
-    value: &str,
-    focused: bool,
-    readonly: bool,
-) {
+fn row(frame: &mut Frame, area: Rect, label: &str, value: &str, focused: bool, readonly: bool) {
     let (label_area, value_area) = split(area);
 
-    let label_style = if focused { theme::focus() } else { theme::muted() };
+    let label_style = if focused {
+        theme::focus()
+    } else {
+        theme::muted()
+    };
     let value_style = if focused {
         theme::focus()
     } else if readonly {
@@ -635,13 +648,25 @@ fn draw_confirm_modal(frame: &mut Frame, area: Rect, title: &str, message: &str)
     let msg_lines = wrap_description(message, inner.width as usize);
     let mut lines = Vec::new();
     for l in msg_lines {
-        lines.push(Line::from(Span::styled(l, Style::default().fg(Color::White))));
+        lines.push(Line::from(Span::styled(
+            l,
+            Style::default().fg(Color::White),
+        )));
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
-        Span::styled(" Enter / Y : Confirm purge ", Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Enter / Y : Confirm purge ",
+            Style::default()
+                .bg(Color::Red)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  "),
-        Span::styled(" Esc / N : Cancel ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+        Span::styled(
+            " Esc / N : Cancel ",
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+        ),
     ]));
 
     frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
@@ -659,11 +684,7 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-fn draw_file_browser_modal(
-    frame: &mut Frame,
-    area: Rect,
-    browser: &crate::app::FileBrowserModal,
-) {
+fn draw_file_browser_modal(frame: &mut Frame, area: Rect, browser: &crate::app::FileBrowserModal) {
     let modal_w = 68u16.min(area.width.saturating_sub(4));
     let modal_h = 16u16.min(area.height.saturating_sub(2));
 
@@ -675,8 +696,16 @@ fn draw_file_browser_modal(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
-        .title(format!(" {} ({} entries) ", browser.title, browser.entries.len()))
+        .border_style(
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+        .title(format!(
+            " {} ({} entries) ",
+            browser.title,
+            browser.entries.len()
+        ))
         .title_alignment(Alignment::Center);
 
     let inner = block.inner(modal_area);
@@ -691,7 +720,10 @@ fn draw_file_browser_modal(
     let path_str = browser.current_dir.display().to_string();
     let max_path_w = (inner.width as usize).saturating_sub(10);
     let trimmed_path = if path_str.len() > max_path_w {
-        format!("…{}", &path_str[path_str.len().saturating_sub(max_path_w)..])
+        format!(
+            "…{}",
+            &path_str[path_str.len().saturating_sub(max_path_w)..]
+        )
     } else {
         path_str
     };
@@ -728,9 +760,14 @@ fn draw_file_browser_modal(
 
         if entry.is_action {
             let style = if is_selected {
-                Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(Color::Green)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
             };
             let text = fit_cols(&format!("{prefix}{}", entry.name), inner.width as usize);
             frame.render_widget(
@@ -739,9 +776,14 @@ fn draw_file_browser_modal(
             );
         } else if entry.is_dir {
             let style = if is_selected {
-                Style::default().bg(Color::White).fg(Color::Black).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(Color::White)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             };
             let text = fit_cols(&format!("{prefix}📁 {}", entry.name), inner.width as usize);
             frame.render_widget(
@@ -751,18 +793,20 @@ fn draw_file_browser_modal(
         } else {
             let is_db = entry.name.ends_with(".db") || entry.name.ends_with(".sqlite");
             let style = if is_selected {
-                Style::default().bg(Color::White).fg(Color::Black).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(Color::White)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
             } else if is_db {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
 
             // Left column: prefix + icon + name, clipped to its fixed area.
-            let name_text = fit_cols(
-                &format!("{prefix}📄 {}", entry.name),
-                left_w as usize,
-            );
+            let name_text = fit_cols(&format!("{prefix}📄 {}", entry.name), left_w as usize);
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(name_text, style))),
                 Rect::new(inner.x, row_y, left_w, 1),

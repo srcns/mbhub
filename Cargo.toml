@@ -1,8 +1,8 @@
 [package]
 name = "mbhub"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
-description = "Sovereign, serverless P2P collective memory network for atomic AI answers"
+description = "The Torrent of Thought — sovereign, serverless P2P collective AI memory network for atomic answers"
 license = "MIT"
 
 [dependencies]

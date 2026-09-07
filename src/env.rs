@@ -9,22 +9,38 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Returns the path to the active `.env` file.
-/// Can be overridden in tests via `MBHUB_ENV_FILE`.
-pub fn env_file_path() -> PathBuf {
+/// Canonical `.env` location: the `MBHUB_ENV_FILE` override or the
+/// owner-only `~/.mbhub/.env`. API keys are ONLY ever written here — never
+/// into a working/project directory where git or sync clients could pick
+/// them up (audit: CWD `.env` hijack).
+pub fn canonical_env_path() -> PathBuf {
     if let Ok(p) = std::env::var("MBHUB_ENV_FILE") {
         return PathBuf::from(p);
     }
-    if PathBuf::from(".env").exists() {
-        return PathBuf::from(".env");
-    }
-    if let Some(home) = std::env::var("HOME").ok().or_else(|| std::env::var("USERPROFILE").ok()) {
+    if let Some(home) = std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())
+    {
         let dir = PathBuf::from(home).join(".mbhub");
         let _ = std::fs::create_dir_all(&dir);
         ensure_dir_owner_only(&dir);
         return dir.join(".env");
     }
     PathBuf::from(".env")
+}
+
+/// Returns the `.env` file used for reads: the canonical path when it
+/// exists, otherwise — as a legacy, read-only convenience — a
+/// working-directory `.env`. Secrets are never written to that legacy file.
+pub fn env_file_path() -> PathBuf {
+    let canonical = canonical_env_path();
+    if canonical.exists() {
+        return canonical;
+    }
+    if std::env::var("MBHUB_ENV_FILE").is_err() && PathBuf::from(".env").exists() {
+        return PathBuf::from(".env");
+    }
+    canonical
 }
 
 /// Best-effort owner-only (0700) permission enforcement on the data
@@ -74,7 +90,13 @@ pub fn provider_to_env_var(provider_name: &str) -> String {
         other => {
             let mut s = other
                 .chars()
-                .map(|c| if c.is_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+                .map(|c| {
+                    if c.is_alphanumeric() {
+                        c.to_ascii_uppercase()
+                    } else {
+                        '_'
+                    }
+                })
                 .collect::<String>();
             while s.contains("__") {
                 s = s.replace("__", "_");
@@ -128,7 +150,9 @@ pub fn load_env_file() -> HashMap<String, String> {
 /// previous file is left untouched (fail closed) — there is deliberately no
 /// insecure direct-write fallback.
 pub fn save_env_var(key: &str, val: &str) {
-    let path = env_file_path();
+    // Secrets are persisted ONLY to the canonical location — never to a
+    // working-directory `.env` (repo/sync leak vector).
+    let path = canonical_env_path();
     let mut lines = Vec::new();
     let mut found = false;
 
@@ -179,7 +203,12 @@ fn write_file_atomically_owner_only(path: &std::path::Path, bytes: &[u8]) -> std
     // so a stale or pre-planted temp file can never be clobbered.
     let mut last_err: Option<std::io::Error> = None;
     for attempt in 0..4u32 {
-        let tmp = parent.join(format!(".{base}.{}.{}.{}.tmp", std::process::id(), nanos, attempt));
+        let tmp = parent.join(format!(
+            ".{base}.{}.{}.{}.tmp",
+            std::process::id(),
+            nanos,
+            attempt
+        ));
         match write_via_temp(&tmp, bytes) {
             Ok(()) => {
                 return match std::fs::rename(&tmp, path) {
@@ -200,9 +229,8 @@ fn write_file_atomically_owner_only(path: &std::path::Path, bytes: &[u8]) -> std
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| {
-        std::io::Error::other("could not create a unique temporary .env file")
-    }))
+    Err(last_err
+        .unwrap_or_else(|| std::io::Error::other("could not create a unique temporary .env file")))
 }
 
 /// Creates the temp file exclusively (0600 on Unix — no world-readable window
@@ -264,7 +292,10 @@ pub fn set_api_key_for_provider(provider_name: &str, key: &str) {
 
 /// Resolves a selected model for a provider from `.env` or SQLite `meta`.
 pub fn get_model_for_provider(provider_name: &str) -> Option<String> {
-    let env_var = format!("{}_MODEL", provider_to_env_var(provider_name).trim_end_matches("_API_KEY"));
+    let env_var = format!(
+        "{}_MODEL",
+        provider_to_env_var(provider_name).trim_end_matches("_API_KEY")
+    );
 
     // 1. Process env
     if let Ok(v) = std::env::var(&env_var) {
@@ -287,7 +318,10 @@ pub fn get_model_for_provider(provider_name: &str) -> Option<String> {
 
 /// Saves a selected model for a provider to both `.env` and SQLite `meta`.
 pub fn set_model_for_provider(provider_name: &str, model: &str) {
-    let env_var = format!("{}_MODEL", provider_to_env_var(provider_name).trim_end_matches("_API_KEY"));
+    let env_var = format!(
+        "{}_MODEL",
+        provider_to_env_var(provider_name).trim_end_matches("_API_KEY")
+    );
     save_env_var(&env_var, model);
     crate::db::set_provider_model(provider_name, model);
 }
@@ -376,7 +410,10 @@ mod tests {
                 name.starts_with(".mbhub_test_env_perm.env.")
             })
             .collect();
-        assert!(leftovers.is_empty(), "atomic write left temp files: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "atomic write left temp files: {leftovers:?}"
+        );
 
         let loaded = load_env_file();
         assert_eq!(loaded.get("TEST_PERM_KEY").unwrap(), "rotated-value");

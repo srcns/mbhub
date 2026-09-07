@@ -47,26 +47,14 @@ impl SafetyVerdict {
 /// *action + target* pair, never a bare keyword.
 static PATTERNS: LazyLock<Vec<(&'static Regex, &'static str)>> = LazyLock::new(|| {
     vec![
-        (
-            &*RE_CSAM_FACILITATION,
-            "Child exploitation facilitation",
-        ),
+        (&*RE_CSAM_FACILITATION, "Child exploitation facilitation"),
         (
             &*RE_EXPLOSIVE_MANUFACTURE,
             "Explosive manufacture instructions",
         ),
-        (
-            &*RE_TOXIN_SYNTHESIS,
-            "Chemical weapon / toxin synthesis",
-        ),
-        (
-            &*RE_DRUG_PRODUCTION,
-            "Illicit drug production instructions",
-        ),
-        (
-            &*RE_ATTACK_PLANNING,
-            "Operational attack planning",
-        ),
+        (&*RE_TOXIN_SYNTHESIS, "Chemical weapon / toxin synthesis"),
+        (&*RE_DRUG_PRODUCTION, "Illicit drug production instructions"),
+        (&*RE_ATTACK_PLANNING, "Operational attack planning"),
         (
             &*RE_TR_FACILITATION,
             "TR: Illicit manufacture / exploitation facilitation",
@@ -191,7 +179,10 @@ mod tests {
 
     #[test]
     fn allows_clean_technical_content() {
-        assert_eq!(screen_text("How does Rust ownership work?"), SafetyVerdict::Allow);
+        assert_eq!(
+            screen_text("How does Rust ownership work?"),
+            SafetyVerdict::Allow
+        );
         assert_eq!(
             screen_text("Explain BLAKE3 hashing in distributed systems."),
             SafetyVerdict::Allow

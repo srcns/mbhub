@@ -7,17 +7,17 @@
 //! compatible records sit on top. In Blind Swarm mode the column is omitted and
 //! the list is newest-first (no relevance tracking).
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
-use ratatui::Frame;
 
 use crate::app::App;
 use crate::model::{DateFormat, InferenceRecord, ShardingMode};
 use crate::theme;
 
 const DATE_W: usize = 16; // "01.01.2026 20:00" is the widest date
-const HIT_W: usize = 7;  // "HIT (%)" header + right-aligned "99.99"
+const HIT_W: usize = 7; // "HIT (%)" header + right-aligned "99.99"
 const GAP: usize = 2;
 
 /// Width of the "[WEB] " badge column. Publisher builds reserve it so web
@@ -29,9 +29,12 @@ const BADGE_W: usize = 6;
 const BADGE_W: usize = 0;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
-    let rows =
-        Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
-            .split(area);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(area);
 
     #[cfg(feature = "publisher")]
     let shortcut_hint = "   ·   p: publish   s: sync web   d: delete";
@@ -42,8 +45,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(
             format!(
                 "{} records · {} GB reserved",
-                app.total_records,
-                app.settings.reserved_gb
+                app.total_records, app.settings.reserved_gb
             ),
             theme::muted(),
         ),
@@ -140,7 +142,10 @@ fn row_item(
     // question starts flush after the DATE column with no dead gap.
     #[cfg(feature = "publisher")]
     let web_badge = if r.publish_candidate {
-        Span::styled("[WEB] ", ratatui::style::Style::default().fg(ratatui::style::Color::Green))
+        Span::styled(
+            "[WEB] ",
+            ratatui::style::Style::default().fg(ratatui::style::Color::Green),
+        )
     } else {
         Span::raw(" ".repeat(BADGE_W))
     };

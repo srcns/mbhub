@@ -25,8 +25,8 @@ mod service;
 mod simhash;
 mod theme;
 mod tos;
-mod uninstall;
 mod ui;
+mod uninstall;
 mod update;
 
 use std::io;
@@ -35,10 +35,10 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::Terminal;
+use ratatui::backend::{CrosstermBackend, TestBackend};
 
 use app::{App, Screen};
 
@@ -171,16 +171,16 @@ fn handle_cli_ask(args: &[String]) -> io::Result<()> {
 
     if db::get_meta("terms_accepted") != Some("true".to_string()) {
         eprintln!("Error: MBHub Terms of Service have not been accepted yet.");
-        eprintln!("Please launch `mbhub` once in your terminal to review and accept the Terms of Service, or run `mbhub ask --accept-terms <query>`.");
+        eprintln!(
+            "Please launch `mbhub` once in your terminal to review and accept the Terms of Service, or run `mbhub ask --accept-terms <query>`."
+        );
         std::process::exit(1);
     }
 
     // Try communicating with background daemon via IPC first
-    let response = if let Some(ipc_resp) =
-        ipc::try_query_daemon(&ipc::IpcRequest::Ask {
-            query: trimmed.to_string(),
-        })
-    {
+    let response = if let Some(ipc_resp) = ipc::try_query_daemon(&ipc::IpcRequest::Ask {
+        query: trimmed.to_string(),
+    }) {
         match ipc_resp {
             ipc::IpcResponse::Answer {
                 question,
@@ -327,7 +327,10 @@ fn handle_cli_cms(args: &[String]) -> io::Result<()> {
             println!("MBHub CMS Status:");
             println!("Repository: {}", cms_dir.display());
             let candidates = db::fetch_blog_export_candidates(0, true);
-            println!("Local Approved Candidates: {} inquiry(ies)", candidates.len());
+            println!(
+                "Local Approved Candidates: {} inquiry(ies)",
+                candidates.len()
+            );
             let content_dir = cms_dir.join("content");
             if content_dir.exists() {
                 let count = std::fs::read_dir(&content_dir)
@@ -351,11 +354,17 @@ fn handle_cli_cms(args: &[String]) -> io::Result<()> {
             if status.success() {
                 println!("[CMS] Rehydration finished successfully.");
             } else {
-                eprintln!("[CMS] Rehydration failed with exit code: {:?}", status.code());
+                eprintln!(
+                    "[CMS] Rehydration failed with exit code: {:?}",
+                    status.code()
+                );
             }
         }
         other => {
-            eprintln!("Unknown CMS command: {}. Available: sync, status, rehydrate", other);
+            eprintln!(
+                "Unknown CMS command: {}. Available: sync, status, rehydrate",
+                other
+            );
             std::process::exit(1);
         }
     }
@@ -466,7 +475,8 @@ fn handle_cli_export_blog(args: &[String]) -> io::Result<()> {
 
             if is_same {
                 // If a legacy hash file existed, clean it up
-                let legacy_hash_file = target_path.join(format!("{base_slug}-{}.md", &hash_hex[..6]));
+                let legacy_hash_file =
+                    target_path.join(format!("{base_slug}-{}.md", &hash_hex[..6]));
                 if legacy_hash_file.exists() && !dry_run {
                     let _ = std::fs::remove_file(&legacy_hash_file);
                 }
@@ -512,7 +522,10 @@ fn handle_cli_export_blog(args: &[String]) -> io::Result<()> {
 
         let file_path = target_path.join(format!("{slug}.md"));
         if dry_run {
-            println!("  [dry-run] Would export #{}: {} -> {:?}", item.id, item.question, file_path);
+            println!(
+                "  [dry-run] Would export #{}: {} -> {:?}",
+                item.id, item.question, file_path
+            );
         } else {
             std::fs::write(&file_path, markdown)?;
             db::mark_published(item.id, chrono::Local::now().timestamp());
@@ -537,12 +550,18 @@ fn handle_cli_export_blog(args: &[String]) -> io::Result<()> {
 #[cfg(feature = "publisher")]
 fn slugify(text: &str) -> String {
     let transliterated = text
-        .replace('ı', "i").replace('İ', "i")
-        .replace('ğ', "g").replace('Ğ', "g")
-        .replace('ü', "u").replace('Ü', "u")
-        .replace('ş', "s").replace('Ş', "s")
-        .replace('ö', "o").replace('Ö', "o")
-        .replace('ç', "c").replace('Ç', "c");
+        .replace('ı', "i")
+        .replace('İ', "i")
+        .replace('ğ', "g")
+        .replace('Ğ', "g")
+        .replace('ü', "u")
+        .replace('Ü', "u")
+        .replace('ş', "s")
+        .replace('Ş', "s")
+        .replace('ö', "o")
+        .replace('Ö', "o")
+        .replace('ç', "c")
+        .replace('Ç', "c");
     let mut slug = String::new();
     let mut prev_dash = true;
     for ch in transliterated.chars() {
@@ -563,17 +582,28 @@ fn slugify(text: &str) -> String {
 }
 
 fn print_cli_help() {
-    println!("MBHub — Sovereign P2P Collective AI Memory (v{})", env!("CARGO_PKG_VERSION"));
+    println!(
+        "MBHub — The Torrent of Thought (v{})",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("\nUsage:");
     println!("  mbhub                     Launch the interactive retro terminal UI");
     println!("  mbhub ask <query> [--json] Ask a question via headless 3-layer pipeline");
     println!("  mbhub daemon              Run the 24/7 background P2P & IPC daemon");
-    println!("  mbhub bootstrap           Run a dedicated rendezvous node (Kademlia + relay server, no data)");
-    println!("  mbhub uninstall           Interactive uninstaller — choose what to remove and what to keep");
-    println!("  mbhub mcp [--accept-terms] Start stdio JSON-RPC 2.0 MCP server (Cursor, Claude, agents)");
+    println!(
+        "  mbhub bootstrap           Run a dedicated rendezvous node (Kademlia + relay server, no data)"
+    );
+    println!(
+        "  mbhub uninstall           Interactive uninstaller — choose what to remove and what to keep"
+    );
+    println!(
+        "  mbhub mcp [--accept-terms] Start stdio JSON-RPC 2.0 MCP server (Cursor, Claude, agents)"
+    );
     #[cfg(feature = "publisher")]
     {
-        println!("  mbhub export-blog [--out <dir>] [--all] Export local Q&A records to Astro markdown");
+        println!(
+            "  mbhub export-blog [--out <dir>] [--all] Export local Q&A records to Astro markdown"
+        );
         println!("  mbhub cms <sync|status|rehydrate> Manage the local web archive pipeline");
         println!("  mbhub simhash <text>      Print the 64-bit SimHash fingerprint of text");
     }
@@ -638,7 +668,9 @@ fn snapshot() -> io::Result<()> {
     println!("{}", render_string(&terms_app, 110, 30));
 
     let mut viewer_app = App::for_screen(Screen::Search);
-    viewer_app.search_input.insert_str("How does distributed P2P inference work?");
+    viewer_app
+        .search_input
+        .insert_str("How does distributed P2P inference work?");
     viewer_app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Enter,
         crossterm::event::KeyModifiers::NONE,
@@ -695,8 +727,13 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
-    fn lock_db() -> (std::sync::MutexGuard<'static, ()>, std::sync::MutexGuard<'static, ()>) {
-        let guard_env = crate::env::ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    fn lock_db() -> (
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let guard_env = crate::env::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let guard_db = DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("MBHUB_DB", "mbhub_test.db");
@@ -779,9 +816,7 @@ mod tests {
         let symbols = |screen: Screen| -> String {
             let app = App::for_screen(screen);
             let buf = buffer_of(&app);
-            (0..110)
-                .map(|x| buf[(x, y)].symbol().to_string())
-                .collect()
+            (0..110).map(|x| buf[(x, y)].symbol().to_string()).collect()
         };
         let search = symbols(Screen::Search);
         let memory = symbols(Screen::Memory);
@@ -871,7 +906,11 @@ mod tests {
                 r.similarity
             );
             assert!(!r.question.trim().is_empty(), "record has empty question");
-            assert!(r.question.chars().count() <= 80, "question exceeds 80 chars: {}", r.question);
+            assert!(
+                r.question.chars().count() <= 80,
+                "question exceeds 80 chars: {}",
+                r.question
+            );
             assert!(!r.content.trim().is_empty(), "record has empty content");
         }
     }
@@ -884,7 +923,10 @@ mod tests {
             app.handle_event(key(KeyCode::Down));
         }
         assert_eq!(app.focus, SettingsField::ShardingMode);
-        assert_eq!(app.settings.sharding_mode, crate::model::ShardingMode::QueryLocality);
+        assert_eq!(
+            app.settings.sharding_mode,
+            crate::model::ShardingMode::QueryLocality
+        );
 
         // Arrow right triggers purge confirm modal
         app.handle_event(key(KeyCode::Right));
@@ -897,7 +939,10 @@ mod tests {
         // Confirm
         app.handle_event(key(KeyCode::Enter));
         assert!(app.confirm_modal.is_none());
-        assert_eq!(app.settings.sharding_mode, crate::model::ShardingMode::BlindSwarm);
+        assert_eq!(
+            app.settings.sharding_mode,
+            crate::model::ShardingMode::BlindSwarm
+        );
 
         // Restore seed
         let _ = db::reseed();
@@ -921,7 +966,10 @@ mod tests {
         // Open Picker Modal
         app.handle_event(key(KeyCode::Enter));
         assert!(app.picker_modal.is_some());
-        assert_eq!(app.picker_modal.as_ref().unwrap().title, "Select hit rate threshold");
+        assert_eq!(
+            app.picker_modal.as_ref().unwrap().title,
+            "Select hit rate threshold"
+        );
         app.handle_event(key(KeyCode::Esc));
         assert!(app.picker_modal.is_none());
     }
@@ -1104,8 +1152,7 @@ mod tests {
         assert_eq!(app.memory_selected, 5);
         let expected_content = format!(
             "# {}\n\n{}",
-            app.records[5].question,
-            app.records[5].content
+            app.records[5].question, app.records[5].content
         );
 
         // Press Enter on record #5
@@ -1183,7 +1230,10 @@ mod tests {
                 break;
             }
         }
-        assert!(found_last_line, "The very last line must be rendered and visible on screen");
+        assert!(
+            found_last_line,
+            "The very last line must be rendered and visible on screen"
+        );
     }
 
     #[test]
@@ -1206,10 +1256,19 @@ mod tests {
             full_screen_text.push('\n');
         }
 
-        assert!(full_screen_text.contains("Reserved storage"), "Title must be present");
-        assert!(full_screen_text.contains("Blind swarm evicts the oldest"), "End of description must not be clipped");
+        assert!(
+            full_screen_text.contains("Reserved storage"),
+            "Title must be present"
+        );
+        assert!(
+            full_screen_text.contains("Blind swarm evicts the oldest"),
+            "End of description must not be clipped"
+        );
         assert!(full_screen_text.contains("💡"), "Hint icon must be present");
-        assert!(full_screen_text.contains("Enter: edit storage quota"), "Hint text must not be clipped");
+        assert!(
+            full_screen_text.contains("Enter: edit storage quota"),
+            "Hint text must not be clipped"
+        );
     }
 
     #[test]
@@ -1251,7 +1310,8 @@ mod tests {
             h,
             "DeepSeek",
             "deepseek-chat",
-        ).expect("valid inference saves");
+        )
+        .expect("valid inference saves");
         assert_eq!(saved.question, q);
         assert_eq!(saved.simhash, h);
         assert_eq!(saved.provider, "DeepSeek");
@@ -1261,7 +1321,10 @@ mod tests {
         let hit_saved = db::find_best_match(q, 90.0);
         assert!(hit_saved.is_some());
         let hit_rec = hit_saved.unwrap();
-        assert_eq!(hit_rec.content, "Zero-cost abstractions compile down to optimal assembly.");
+        assert_eq!(
+            hit_rec.content,
+            "Zero-cost abstractions compile down to optimal assembly."
+        );
         assert_eq!(hit_rec.provider, "DeepSeek");
         assert_eq!(hit_rec.model, "deepseek-chat");
 
@@ -1275,7 +1338,8 @@ mod tests {
         let mut app = App::for_screen(Screen::Search);
 
         // Query known seed entry
-        app.search_input.insert_str("When should Arc<Mutex<T>> be used in Rust?");
+        app.search_input
+            .insert_str("When should Arc<Mutex<T>> be used in Rust?");
         app.handle_event(key(KeyCode::Enter));
 
         assert!(app.viewer.is_some());
@@ -1294,7 +1358,8 @@ mod tests {
         app.settings.api_key.clear();
 
         // Query unknown entry
-        app.search_input.insert_str("Quantum teleportation protocol details");
+        app.search_input
+            .insert_str("Quantum teleportation protocol details");
         app.handle_event(key(KeyCode::Enter));
 
         assert!(app.viewer.is_some());
@@ -1336,6 +1401,8 @@ mod tests {
                 provider: "DeepSeek".to_string(),
                 model: "deepseek-chat".to_string(),
                 content_hash: String::new(),
+                pow: String::new(),
+                signature: Vec::new(),
             };
             resp.content_hash = resp.canonical_content_hash();
             // Send response directly through channel
@@ -1414,11 +1481,19 @@ mod tests {
         // 6. Simulate fresh app start (rebooting after 2 days)
         let restarted_app = App::new();
         assert_eq!(
-            restarted_app.settings.provider_keys.get("OpenRouter").unwrap(),
+            restarted_app
+                .settings
+                .provider_keys
+                .get("OpenRouter")
+                .unwrap(),
             "sk-or-v1-test-openrouter-key"
         );
         assert_eq!(
-            restarted_app.settings.provider_keys.get("DeepSeek").unwrap(),
+            restarted_app
+                .settings
+                .provider_keys
+                .get("DeepSeek")
+                .unwrap(),
             "sk-ds-test-deepseek-key"
         );
 
@@ -1444,7 +1519,11 @@ mod tests {
             let mut p = picker.clone();
             p.selected = i;
             // Moving within the window (0..10) must NOT scroll: offset stays 0!
-            assert_eq!(p.scroll_into_view(visible_h), 0, "selection {i} should not scroll");
+            assert_eq!(
+                p.scroll_into_view(visible_h),
+                0,
+                "selection {i} should not scroll"
+            );
         }
 
         // When moving down past the edge to index 15
@@ -1490,15 +1569,38 @@ mod tests {
         // Row 1 (inside body area) should contain the provenance bar with solid ACCENT background
         assert_eq!(buf[(0, 1)].bg, theme::ACCENT);
         let line_text: String = (0..80).map(|x| buf[(x, 1)].symbol()).collect();
-        assert!(line_text.contains("PROVIDER:"), "line should contain PROVIDER: in {}", line_text);
-        assert!(line_text.contains("OpenAI"), "line should contain OpenAI in {}", line_text);
-        assert!(line_text.contains("MODEL:"), "line should contain MODEL: in {}", line_text);
-        assert!(line_text.contains("gpt-4o"), "line should contain gpt-4o in {}", line_text);
-        assert!(line_text.contains("DATE:"), "line should contain DATE: in {}", line_text);
+        assert!(
+            line_text.contains("PROVIDER:"),
+            "line should contain PROVIDER: in {}",
+            line_text
+        );
+        assert!(
+            line_text.contains("OpenAI"),
+            "line should contain OpenAI in {}",
+            line_text
+        );
+        assert!(
+            line_text.contains("MODEL:"),
+            "line should contain MODEL: in {}",
+            line_text
+        );
+        assert!(
+            line_text.contains("gpt-4o"),
+            "line should contain gpt-4o in {}",
+            line_text
+        );
+        assert!(
+            line_text.contains("DATE:"),
+            "line should contain DATE: in {}",
+            line_text
+        );
 
         // Row 2 starts directly with the markdown content (no divider dashes row)
         let row2_text: String = (0..80).map(|x| buf[(x, 2)].symbol()).collect();
-        assert!(!row2_text.starts_with("───"), "row 2 must not be a divider line");
+        assert!(
+            !row2_text.starts_with("───"),
+            "row 2 must not be a divider line"
+        );
 
         let _ = db::clear_all();
     }
@@ -1590,7 +1692,10 @@ mod tests {
                 .map(|(i, _)| i)
                 .collect()
         };
-        assert!(file_indices.len() >= 2, "test needs at least two files in cwd");
+        assert!(
+            file_indices.len() >= 2,
+            "test needs at least two files in cwd"
+        );
 
         let modal_x = 21u16; // (110-68)/2 for the 110-wide test buffer
         let inner_x = modal_x + 1;
@@ -1739,7 +1844,8 @@ mod tests {
             0x1234567890ABCDEF,
             "OpenAI",
             "gpt-4o",
-        ).expect("valid inference saves");
+        )
+        .expect("valid inference saves");
 
         let expected_hash = content_hash::compute_content_hash(
             "What is BLAKE3?",
@@ -1750,11 +1856,13 @@ mod tests {
 
         // Verify stored content_hash directly in SQLite
         let conn = rusqlite::Connection::open(db::db_path()).unwrap();
-        let stored_hash: String = conn.query_row(
-            "SELECT content_hash FROM inferences WHERE question = ?1",
-            ["What is BLAKE3?"],
-            |row| row.get(0),
-        ).unwrap();
+        let stored_hash: String = conn
+            .query_row(
+                "SELECT content_hash FROM inferences WHERE question = ?1",
+                ["What is BLAKE3?"],
+                |row| row.get(0),
+            )
+            .unwrap();
 
         assert_eq!(stored_hash, expected_hash);
         assert_eq!(stored_hash.len(), 64);
@@ -1771,15 +1879,27 @@ mod tests {
 
     #[test]
     fn sanitize_strips_terminal_escape_in_markdown() {
-        let malicious_payload = "# Normal Title\n\n\x1b[31mRed text\x1b[0m and \x1b]52;c;bWFsaWNpb3Vz\x07normal text.";
+        let malicious_payload =
+            "# Normal Title\n\n\x1b[31mRed text\x1b[0m and \x1b]52;c;bWFsaWNpb3Vz\x07normal text.";
         let lines = ui::markdown::render_markdown(malicious_payload, 80);
 
         let mut all_text = String::new();
         for line in lines {
             for span in line.spans {
-                assert!(!span.content.contains('\x1b'), "Escape byte found in span: {}", span.content);
-                assert!(!span.content.contains('\x07'), "BEL byte found in span: {}", span.content);
-                assert!(!span.content.contains("bWFsaWNpb3Vz"), "OSC 52 payload should be stripped");
+                assert!(
+                    !span.content.contains('\x1b'),
+                    "Escape byte found in span: {}",
+                    span.content
+                );
+                assert!(
+                    !span.content.contains('\x07'),
+                    "BEL byte found in span: {}",
+                    span.content
+                );
+                assert!(
+                    !span.content.contains("bWFsaWNpb3Vz"),
+                    "OSC 52 payload should be stripped"
+                );
                 all_text.push_str(&span.content);
             }
         }
@@ -1809,6 +1929,7 @@ mod tests {
             hop_ttl: crate::p2p::MAX_HOP_TTL,
             is_truncated: false,
             pow: String::new(),
+            signature: Vec::new(),
             author_peer_id: String::new(),
         };
         msg.content_hash = msg.canonical_content_hash();
@@ -1849,7 +1970,10 @@ mod tests {
         app.tick();
         assert_eq!(app.total_records, before + 1);
         let rec = db::find_best_match("What is a monad?", 90.0).unwrap();
-        assert!(rec.is_swarm, "swarm record must carry the unverified-source flag");
+        assert!(
+            rec.is_swarm,
+            "swarm record must carry the unverified-source flag"
+        );
 
         let _ = db::clear_all();
     }
@@ -1862,36 +1986,64 @@ mod tests {
         let before = app.total_records;
 
         // 1. Inbound empty content must be dropped by peer client intelligence
-        let empty_msg = valid_swarm_message("What is distributed consensus?", "", "OpenAI", "gpt-4o");
+        let empty_msg =
+            valid_swarm_message("What is distributed consensus?", "", "OpenAI", "gpt-4o");
         if let Some(p2p) = &app.p2p {
             p2p.simulate_inbound_inference(empty_msg.clone());
         }
         app.tick();
-        assert_eq!(app.total_records, before, "empty gossip content must be dropped");
+        assert_eq!(
+            app.total_records, before,
+            "empty gossip content must be dropped"
+        );
 
         // 2. Inbound whitespace-only content must be dropped
-        let whitespace_msg = valid_swarm_message("What is distributed consensus?", "   \n\t  ", "OpenAI", "gpt-4o");
+        let whitespace_msg = valid_swarm_message(
+            "What is distributed consensus?",
+            "   \n\t  ",
+            "OpenAI",
+            "gpt-4o",
+        );
         if let Some(p2p) = &app.p2p {
             p2p.simulate_inbound_inference(whitespace_msg);
         }
         app.tick();
-        assert_eq!(app.total_records, before, "whitespace-only gossip content must be dropped");
+        assert_eq!(
+            app.total_records, before,
+            "whitespace-only gossip content must be dropped"
+        );
 
         // 3. Inbound content < 10 chars must be dropped
-        let short_msg = valid_swarm_message("What is distributed consensus?", "Too short", "OpenAI", "gpt-4o");
+        let short_msg = valid_swarm_message(
+            "What is distributed consensus?",
+            "Too short",
+            "OpenAI",
+            "gpt-4o",
+        );
         if let Some(p2p) = &app.p2p {
             p2p.simulate_inbound_inference(short_msg);
         }
         app.tick();
-        assert_eq!(app.total_records, before, "content under 10 chars must be dropped");
+        assert_eq!(
+            app.total_records, before,
+            "content under 10 chars must be dropped"
+        );
 
         // 4. Inbound question < 3 chars must be dropped
-        let short_q_msg = valid_swarm_message("ab", "Consensus is achieved via Byzantine fault tolerance.", "OpenAI", "gpt-4o");
+        let short_q_msg = valid_swarm_message(
+            "ab",
+            "Consensus is achieved via Byzantine fault tolerance.",
+            "OpenAI",
+            "gpt-4o",
+        );
         if let Some(p2p) = &app.p2p {
             p2p.simulate_inbound_inference(short_q_msg);
         }
         app.tick();
-        assert_eq!(app.total_records, before, "question under 3 chars must be dropped");
+        assert_eq!(
+            app.total_records, before,
+            "question under 3 chars must be dropped"
+        );
 
         // 5. Inbound truncated content must be dropped
         let trunc_msg = valid_swarm_message(
@@ -1904,12 +2056,18 @@ mod tests {
             p2p.simulate_inbound_inference(trunc_msg);
         }
         app.tick();
-        assert_eq!(app.total_records, before, "truncated gossip content must be dropped");
+        assert_eq!(
+            app.total_records, before,
+            "truncated gossip content must be dropped"
+        );
 
         // 6. Verify Outbound Hard Gate: empty content is never enqueued for broadcast
         if let Some(p2p) = &app.p2p {
             p2p.broadcast_inference(empty_msg);
-            assert!(p2p.outbound_inference_tx.is_empty(), "empty inference must be dropped at broadcast gate");
+            assert!(
+                p2p.outbound_inference_tx.is_empty(),
+                "empty inference must be dropped at broadcast gate"
+            );
         }
 
         let _ = db::clear_all();
@@ -1933,7 +2091,10 @@ mod tests {
             p2p.simulate_inbound_inference(illegal);
         }
         app.tick();
-        assert_eq!(app.total_records, before, "prohibited gossip must be dropped");
+        assert_eq!(
+            app.total_records, before,
+            "prohibited gossip must be dropped"
+        );
 
         // Leaked secret must never touch disk.
         let leaking = valid_swarm_message(
@@ -1946,7 +2107,10 @@ mod tests {
             p2p.simulate_inbound_inference(leaking);
         }
         app.tick();
-        assert_eq!(app.total_records, before, "secret-carrying gossip must be dropped");
+        assert_eq!(
+            app.total_records, before,
+            "secret-carrying gossip must be dropped"
+        );
 
         let _ = db::clear_all();
     }
@@ -1969,7 +2133,10 @@ mod tests {
             }
             app.tick();
         }
-        assert_eq!(app.total_records, 1, "replayed gossip must be stored exactly once");
+        assert_eq!(
+            app.total_records, 1,
+            "replayed gossip must be stored exactly once"
+        );
 
         let _ = db::clear_all();
     }
@@ -1991,7 +2158,10 @@ mod tests {
         // Query is held: not dispatched to AI, still pending, still jittered.
         assert!(app.pending_query.is_some());
         assert!(app.pending_query.as_ref().unwrap().broadcast_at.is_some());
-        assert!(app.active_stream.is_none(), "must not fall back to AI during jitter hold");
+        assert!(
+            app.active_stream.is_none(),
+            "must not fall back to AI during jitter hold"
+        );
     }
 
     #[test]
@@ -2025,8 +2195,14 @@ mod tests {
         // Render: provenance bar must show "Unverified (swarm)", never the brand.
         let buf = buffer_of(&app);
         let line_text: String = (0..110).map(|x| buf[(x, 1)].symbol()).collect();
-        assert!(line_text.contains("Unverified (swarm)"), "bar must show unverified: {line_text}");
-        assert!(!line_text.contains("PROVIDER: Anthropic"), "claimed brand must not be shown as verified");
+        assert!(
+            line_text.contains("Unverified (swarm)"),
+            "bar must show unverified: {line_text}"
+        );
+        assert!(
+            !line_text.contains("PROVIDER: Anthropic"),
+            "claimed brand must not be shown as verified"
+        );
 
         let _ = db::clear_all();
     }
@@ -2043,7 +2219,10 @@ mod tests {
         // footprint, so pruning must actually occur.)
         // `false` = Blind Swarm semantics: oldest-first eviction.
         let pruned = db::enforce_storage_limit_bytes(65_000, false);
-        assert!(pruned > 0, "oldest records must be pruned under a tiny ceiling");
+        assert!(
+            pruned > 0,
+            "oldest records must be pruned under a tiny ceiling"
+        );
         assert!(db::count_records() < before);
 
         // Physical footprint (db + wal) must stay near the ceiling after
@@ -2052,8 +2231,13 @@ mod tests {
         // rather than an exact byte threshold.
         let db_file = db::db_path();
         let size_after = std::fs::metadata(&db_file).map(|m| m.len()).unwrap_or(0)
-            + std::fs::metadata(format!("{db_file}-wal")).map(|m| m.len()).unwrap_or(0);
-        assert!(size_after <= 70_000, "db footprint stays near the ceiling (got {size_after})");
+            + std::fs::metadata(format!("{db_file}-wal"))
+                .map(|m| m.len())
+                .unwrap_or(0);
+        assert!(
+            size_after <= 70_000,
+            "db footprint stays near the ceiling (got {size_after})"
+        );
 
         let _ = db::reseed();
     }
@@ -2075,7 +2259,10 @@ mod tests {
         assert_eq!(crate::model::Settings::default().reserved_gb, 1);
         let _guard = lock_db();
         let app = App::for_screen(Screen::Memory);
-        assert_eq!(app.settings.reserved_gb, 1, "fresh install defaults to 1 GB");
+        assert_eq!(
+            app.settings.reserved_gb, 1,
+            "fresh install defaults to 1 GB"
+        );
     }
 
     #[test]
@@ -2087,7 +2274,8 @@ mod tests {
         // Store an answer to a question the user has never asked.
         let unrelated_q = "Quantum entanglement teleportation protocols";
         let h = crate::simhash::compute_simhash(unrelated_q);
-        let saved = db::save_inference(unrelated_q, "Unrelated answer.", h, "OpenAI", "gpt-4o").expect("valid save");
+        let saved = db::save_inference(unrelated_q, "Unrelated answer.", h, "OpenAI", "gpt-4o")
+            .expect("valid save");
         assert_eq!(db::count_records(), before + 1);
 
         // The Hit Rate Threshold gates DISPLAY, not storage: a very different
@@ -2128,9 +2316,18 @@ mod tests {
         let ordered = db::load_records_window(0, 10);
         assert!(!ordered.is_empty());
         // The black-hole record is now most similar to the user's past query.
-        assert_eq!(ordered[0].question, q2, "most relevant record must be on top");
-        assert!(ordered[0].locality > 0.0, "locality must be scored against the profile");
-        assert!(ordered[0].locality > ordered[1].locality, "relevance ordering must hold");
+        assert_eq!(
+            ordered[0].question, q2,
+            "most relevant record must be on top"
+        );
+        assert!(
+            ordered[0].locality > 0.0,
+            "locality must be scored against the profile"
+        );
+        assert!(
+            ordered[0].locality > ordered[1].locality,
+            "relevance ordering must hold"
+        );
     }
 
     #[test]
@@ -2141,13 +2338,15 @@ mod tests {
 
         let old_q = "Old record question";
         let h_old = crate::simhash::compute_simhash(old_q);
-        let _ = db::save_inference(old_q, "Old answer.", h_old, "OpenAI", "gpt-4o").expect("valid save");
+        let _ = db::save_inference(old_q, "Old answer.", h_old, "OpenAI", "gpt-4o")
+            .expect("valid save");
 
         // Sleep a moment so the second record has a strictly newer timestamp.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let new_q = "New record question";
         let h_new = crate::simhash::compute_simhash(new_q);
-        let _ = db::save_inference(new_q, "New answer.", h_new, "OpenAI", "gpt-4o").expect("valid save");
+        let _ = db::save_inference(new_q, "New answer.", h_new, "OpenAI", "gpt-4o")
+            .expect("valid save");
 
         let recent = db::load_records_window_recent(0, 10);
         assert_eq!(recent[0].question, new_q, "Blind Swarm lists newest first");
@@ -2187,13 +2386,8 @@ mod tests {
             // The one record the user cares about (high locality, newest).
             let relevant_q = "What is a black hole?";
             let h_r = crate::simhash::compute_simhash(relevant_q);
-            stmt.execute(rusqlite::params![
-                now,
-                relevant_q,
-                h_r as i64,
-                95.0f64
-            ])
-            .unwrap();
+            stmt.execute(rusqlite::params![now, relevant_q, h_r as i64, 95.0f64])
+                .unwrap();
         }
 
         let noise_before = db::count_records() - 1;
@@ -2201,17 +2395,26 @@ mod tests {
 
         // Force eviction under a tiny ceiling with Query Locality semantics.
         let dbg_size = std::fs::metadata(&db_file).map(|m| m.len()).unwrap_or(0)
-            + std::fs::metadata(format!("{db_file}-wal")).map(|m| m.len()).unwrap_or(0);
+            + std::fs::metadata(format!("{db_file}-wal"))
+                .map(|m| m.len())
+                .unwrap_or(0);
         eprintln!("DBG size_before={dbg_size} rows={}", db::count_records());
         let pruned = db::enforce_storage_limit_bytes(45_000, true);
-        eprintln!("DBG pruned={pruned} rows_after={} size_after={}", db::count_records(),
+        eprintln!(
+            "DBG pruned={pruned} rows_after={} size_after={}",
+            db::count_records(),
             std::fs::metadata(&db_file).map(|m| m.len()).unwrap_or(0)
-            + std::fs::metadata(format!("{db_file}-wal")).map(|m| m.len()).unwrap_or(0));
+                + std::fs::metadata(format!("{db_file}-wal"))
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+        );
         assert!(pruned > 0, "eviction must prune under the tiny ceiling");
 
         let remaining = db::load_records();
         assert!(
-            remaining.iter().any(|r| r.question == "What is a black hole?"),
+            remaining
+                .iter()
+                .any(|r| r.question == "What is a black hole?"),
             "relevant record must survive locality-aware eviction"
         );
         let noise_after = remaining
@@ -2244,7 +2447,10 @@ mod tests {
         app.handle_event(key(KeyCode::Right)); // opens purge confirm
         app.handle_event(key(KeyCode::Enter)); // confirm
 
-        assert!(db::load_profile_hashes().is_empty(), "profile must not leak across mode switch");
+        assert!(
+            db::load_profile_hashes().is_empty(),
+            "profile must not leak across mode switch"
+        );
 
         let _ = db::reseed();
     }
@@ -2313,7 +2519,14 @@ mod tests {
 
         let res = headless::execute_ask(q, None);
         assert!(res.is_ok());
-        if let Ok(ipc::IpcResponse::Answer { question, content, source, is_swarm, .. }) = res {
+        if let Ok(ipc::IpcResponse::Answer {
+            question,
+            content,
+            source,
+            is_swarm,
+            ..
+        }) = res
+        {
             assert_eq!(question, q);
             assert_eq!(content, ans);
             assert!(source.contains("L1"));
@@ -2331,13 +2544,30 @@ mod tests {
         // Empty content
         assert!(db::save_inference("What is Rust?", "", 123, "OpenAI", "gpt-4o").is_none());
         // Whitespace only
-        assert!(db::save_inference("What is Rust?", "   \n\t  ", 123, "OpenAI", "gpt-4o").is_none());
+        assert!(
+            db::save_inference("What is Rust?", "   \n\t  ", 123, "OpenAI", "gpt-4o").is_none()
+        );
         // Too short (< 10 chars)
         assert!(db::save_inference("What is Rust?", "Short", 123, "OpenAI", "gpt-4o").is_none());
         // Short question (< 3 chars)
-        assert!(db::save_inference("a?", "Valid content that has enough length", 123, "OpenAI", "gpt-4o").is_none());
+        assert!(
+            db::save_inference(
+                "a?",
+                "Valid content that has enough length",
+                123,
+                "OpenAI",
+                "gpt-4o"
+            )
+            .is_none()
+        );
         // Valid content saves properly
-        let saved = db::save_inference("What is Rust?", "Rust is a systems programming language.", 123, "OpenAI", "gpt-4o");
+        let saved = db::save_inference(
+            "What is Rust?",
+            "Rust is a systems programming language.",
+            123,
+            "OpenAI",
+            "gpt-4o",
+        );
         assert!(saved.is_some());
         let _ = db::clear_all();
     }
@@ -2348,7 +2578,8 @@ mod tests {
         let _ = db::clear_all();
         db::clear_tombstones();
         let q = "What is cryptographic negative signaling?";
-        let c = "Negative signaling uses cryptographic tombstones to prune poisoned data permanently.";
+        let c =
+            "Negative signaling uses cryptographic tombstones to prune poisoned data permanently.";
         let sim = crate::simhash::compute_simhash(q);
 
         let saved = db::save_inference(q, c, sim, "TestProv", "test-model").expect("valid save");
@@ -2366,7 +2597,10 @@ mod tests {
 
         // Attempting to save the exact same content again must be rejected by tombstone guard
         let reinsert = db::save_inference(q, c, sim, "TestProv", "test-model");
-        assert!(reinsert.is_none(), "tombstoned content must never be re-saved");
+        assert!(
+            reinsert.is_none(),
+            "tombstoned content must never be re-saved"
+        );
 
         let _ = db::clear_all();
         db::clear_tombstones();
@@ -2383,29 +2617,57 @@ mod tests {
         let sim = crate::simhash::compute_simhash(q);
 
         // 1. Truncated record saves locally so the user can inspect partial output
-        let trunc_saved = db::save_inference_with_truncated(q, c_trunc, sim, "OpenRouter", "deepseek-v4", true);
+        let trunc_saved =
+            db::save_inference_with_truncated(q, c_trunc, sim, "OpenRouter", "deepseek-v4", true);
         assert!(trunc_saved.is_some());
         let record = trunc_saved.unwrap();
         assert!(record.is_truncated);
 
         // 2. Cache matching MUST ignore truncated records so re-asking fetches a fresh, complete answer
-        assert!(db::find_best_match_by_hash(sim, 85.0).is_none(), "truncated record must not hit L1 cache");
-        assert!(db::find_best_match_by_hash_fresh(sim, 85.0, Some(0)).is_none(), "truncated record must not hit fresh L1 cache");
-        assert!(db::find_best_match_query_fresh(q, 85.0, Some(0)).is_none(), "truncated record must not hit fresh query cache");
+        assert!(
+            db::find_best_match_by_hash(sim, 85.0).is_none(),
+            "truncated record must not hit L1 cache"
+        );
+        assert!(
+            db::find_best_match_by_hash_fresh(sim, 85.0, Some(0)).is_none(),
+            "truncated record must not hit fresh L1 cache"
+        );
+        assert!(
+            db::find_best_match_query_fresh(q, 85.0, Some(0)).is_none(),
+            "truncated record must not hit fresh query cache"
+        );
 
         // 3. Swarm integrity check strictly rejects truncated inference payloads
         let mut swarm_trunc = valid_swarm_message(q, c_trunc, "OpenRouter", "deepseek-v4");
         swarm_trunc.is_truncated = true;
-        assert!(!swarm_trunc.passes_integrity_checks(swarm_trunc.timestamp), "swarm must reject is_truncated = true");
+        assert!(
+            !swarm_trunc.passes_integrity_checks(swarm_trunc.timestamp),
+            "swarm must reject is_truncated = true"
+        );
 
         // 4. Local storage has NO 128 KB cap — huge answers (e.g. 150 KB) save fine locally
         let q_large = "Give me a 150KB technical manual on distributed database architecture.";
         let sim_large = crate::simhash::compute_simhash(q_large);
-        let large_content = format!("Technical Manual\n{}", "Paragraph of architecture details.\n".repeat(4500));
-        assert!(large_content.len() > crate::p2p::MAX_GOSSIP_PAYLOAD, "large content must exceed 128 KB");
+        let large_content = format!(
+            "Technical Manual\n{}",
+            "Paragraph of architecture details.\n".repeat(4500)
+        );
+        assert!(
+            large_content.len() > crate::p2p::MAX_GOSSIP_PAYLOAD,
+            "large content must exceed 128 KB"
+        );
 
-        let large_saved = db::save_inference(q_large, &large_content, sim_large, "OpenRouter", "deepseek-v4");
-        assert!(large_saved.is_some(), "local storage must have no arbitrary 128KB ceiling");
+        let large_saved = db::save_inference(
+            q_large,
+            &large_content,
+            sim_large,
+            "OpenRouter",
+            "deepseek-v4",
+        );
+        assert!(
+            large_saved.is_some(),
+            "local storage must have no arbitrary 128KB ceiling"
+        );
         assert_eq!(large_saved.unwrap().content.len(), large_content.len());
 
         // L1 cache matches large complete records locally
@@ -2414,7 +2676,10 @@ mod tests {
 
         // 5. But P2P Swarm integrity strictly enforces the 128 KB wire ceiling
         let swarm_large = valid_swarm_message(q_large, &large_content, "OpenRouter", "deepseek-v4");
-        assert!(!swarm_large.passes_integrity_checks(swarm_large.timestamp), "swarm wire must enforce 128 KB ceiling");
+        assert!(
+            !swarm_large.passes_integrity_checks(swarm_large.timestamp),
+            "swarm wire must enforce 128 KB ceiling"
+        );
 
         let _ = db::clear_all();
         db::clear_tombstones();
@@ -2428,7 +2693,10 @@ mod tests {
         // 1. Initial launch without terms accepted has terms_modal active and p2p deferred
         let mut app = App::new();
         assert!(app.terms_modal, "First run must show terms modal");
-        assert!(app.p2p.is_none(), "P2P network must not connect before terms are accepted");
+        assert!(
+            app.p2p.is_none(),
+            "P2P network must not connect before terms are accepted"
+        );
 
         // 2. Declining terms with Esc or 'q' flags quit
         app.handle_event(Event::Key(crossterm::event::KeyEvent::new(
@@ -2444,13 +2712,22 @@ mod tests {
             crossterm::event::KeyCode::Enter,
             crossterm::event::KeyModifiers::NONE,
         )));
-        assert!(!app2.terms_modal, "Terms modal should dismiss after acceptance");
+        assert!(
+            !app2.terms_modal,
+            "Terms modal should dismiss after acceptance"
+        );
         assert_eq!(db::get_meta("terms_accepted"), Some("true".to_string()));
-        assert!(app2.p2p.is_some(), "P2P network should be running after terms are accepted");
+        assert!(
+            app2.p2p.is_some(),
+            "P2P network should be running after terms are accepted"
+        );
 
         // 4. Subsequent launch starts directly with terms_modal = false
         let app3 = App::new();
-        assert!(!app3.terms_modal, "Subsequent runs must not re-prompt for terms");
+        assert!(
+            !app3.terms_modal,
+            "Subsequent runs must not re-prompt for terms"
+        );
         assert!(app3.p2p.is_some());
 
         // Restore accepted state
@@ -2461,7 +2738,9 @@ mod tests {
     #[cfg(feature = "publisher")]
     fn web_sync_status_indicator_updates_and_auto_hides() {
         let _guard = lock_db();
-        let _cms_guard = crate::cms::CMS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _cms_guard = crate::cms::CMS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let dir = std::env::temp_dir().join(format!("mbhub_tui_sync_test_{}", std::process::id()));
         let scripts = dir.join("scripts");
@@ -2498,10 +2777,15 @@ mod tests {
         // After the TTL the indicator clears itself automatically.
         app.sync_status = Some(app::SyncStatus::Done {
             success: true,
-            shown_at: std::time::Instant::now() - app::SYNC_STATUS_TTL - std::time::Duration::from_millis(1),
+            shown_at: std::time::Instant::now()
+                - app::SYNC_STATUS_TTL
+                - std::time::Duration::from_millis(1),
         });
         app.tick();
-        assert_eq!(app.sync_status, None, "indicator must auto-hide after the TTL");
+        assert_eq!(
+            app.sync_status, None,
+            "indicator must auto-hide after the TTL"
+        );
 
         unsafe {
             std::env::remove_var("MBHUB_CMS_DIR");
@@ -2521,31 +2805,56 @@ mod tests {
         let q1 = "How does Raft consensus elect a leader?";
         let c1 = "In Raft, candidate nodes request votes from peers when heartbeat election timeout expires.";
         let sim1 = simhash::compute_simhash(q1);
-        let _rec1 = db::save_inference(q1, c1, sim1, "DeepSeek", "deepseek-chat").expect("valid save");
+        let _rec1 =
+            db::save_inference(q1, c1, sim1, "DeepSeek", "deepseek-chat").expect("valid save");
 
         // 2. Swarm record -> must NOT be candidate (Phase 0 privacy gate)
         let q2 = "How to configure WireGuard VPN?";
         let c2 = "Generate private and public keys using wg genkey and configure interface wg0.";
         let sim2 = simhash::compute_simhash(q2);
         let hash2 = content_hash::compute_content_hash(q2, c2, "SwarmPeer", "model");
-        let _rec2 = db::save_swarm_inference(q2, c2, sim2, "SwarmPeer", "model", &hash2, "12D3KooWPublisherTestPeer_________________01").expect("valid save");
+        let _rec2 = db::save_swarm_inference(
+            q2,
+            c2,
+            sim2,
+            "SwarmPeer",
+            "model",
+            &hash2,
+            "12D3KooWPublisherTestPeer_________________01",
+        )
+        .expect("valid save");
 
         // 3. Local record containing sensitive API key -> should be candidate in DB, but blocked by second-pass DLP in export
         let q3 = "What is my API key?";
         let c3 = "Here is the key: sk-abcdefghijklmnopqrstuvwxyz1234567890.";
         let sim3 = simhash::compute_simhash(q3);
-        let _rec3 = db::save_inference(q3, c3, sim3, "DeepSeek", "deepseek-chat").expect("valid save");
+        let _rec3 =
+            db::save_inference(q3, c3, sim3, "DeepSeek", "deepseek-chat").expect("valid save");
 
         // Verify candidates from DB: only local records (rec1 and rec3), NOT swarm record (rec2)
         let candidates = db::fetch_blog_export_candidates(0, true);
-        assert_eq!(candidates.len(), 2, "Only local records (is_swarm=0) should be candidates");
+        assert_eq!(
+            candidates.len(),
+            2,
+            "Only local records (is_swarm=0) should be candidates"
+        );
         assert!(candidates.iter().any(|c| c.question == q1));
         assert!(candidates.iter().any(|c| c.question == q3));
         assert!(!candidates.iter().any(|c| c.question == q2));
 
         // Test export command with a temporary directory
-        let temp_dir = std::env::temp_dir().join(format!("mbhub_blog_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        let args = vec!["--out".to_string(), temp_dir.to_string_lossy().to_string(), "--all".to_string()];
+        let temp_dir = std::env::temp_dir().join(format!(
+            "mbhub_blog_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let args = vec![
+            "--out".to_string(),
+            temp_dir.to_string_lossy().to_string(),
+            "--all".to_string(),
+        ];
 
         let res = handle_cli_export_blog(&args);
         assert!(res.is_ok());
@@ -2553,8 +2862,15 @@ mod tests {
         // Verify exported files:
         // rec1 must be exported
         // rec3 must be skipped due to DLP
-        let entries: Vec<_> = std::fs::read_dir(&temp_dir).unwrap().filter_map(|e| e.ok()).collect();
-        assert_eq!(entries.len(), 1, "Only rec1 should be exported; rec3 blocked by DLP");
+        let entries: Vec<_> = std::fs::read_dir(&temp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "Only rec1 should be exported; rec3 blocked by DLP"
+        );
 
         let file_content = std::fs::read_to_string(entries[0].path()).unwrap();
         assert!(file_content.contains(q1));

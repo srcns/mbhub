@@ -14,9 +14,9 @@
 //! connect and issue IPC requests. Documented limitation (audit O9); closing
 //! it requires a shared-secret or named-pipe + ACL design.
 
+use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
@@ -186,7 +186,10 @@ mod transport {
             let mut line = String::new();
             reader.read_line(&mut line)?;
             if line.trim().is_empty() {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "empty line"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "empty line",
+                ));
             }
             let req: IpcRequest = serde_json::from_str(line.trim())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -269,7 +272,10 @@ mod transport {
             let mut line = String::new();
             reader.read_line(&mut line)?;
             if line.trim().is_empty() {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "empty line"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "empty line",
+                ));
             }
             let req: IpcRequest = serde_json::from_str(line.trim())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -424,7 +430,8 @@ mod tests {
             let mut conn = listener.accept().expect("accept");
             let req = conn.read_request().expect("read request");
             assert!(matches!(req, IpcRequest::Ping));
-            conn.write_response(&IpcResponse::Pong).expect("write response");
+            conn.write_response(&IpcResponse::Pong)
+                .expect("write response");
         });
         let mut client = Stream::connect().expect("client connect");
         let resp = client.send_request(&IpcRequest::Ping).expect("ping");

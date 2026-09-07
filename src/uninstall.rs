@@ -16,7 +16,9 @@ use std::path::PathBuf;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -50,7 +52,12 @@ struct Item {
 
 impl Item {
     fn new(label: &'static str, detail: &'static str, kind: Kind, checked: bool) -> Self {
-        Self { label, detail, kind, checked }
+        Self {
+            label,
+            detail,
+            kind,
+            checked,
+        }
     }
 }
 
@@ -133,7 +140,12 @@ impl UninstallApp {
                 false,
             ),
         ];
-        Self { items, selected: 0, view: View::Checklist, results: Vec::new() }
+        Self {
+            items,
+            selected: 0,
+            view: View::Checklist,
+            results: Vec::new(),
+        }
     }
 
     fn toggle(&mut self) {
@@ -245,14 +257,19 @@ fn remove_home_mbhub(names: &[&str]) {
 
 /// Stops the daemon and removes its systemd user unit.
 fn stop_and_remove_daemon_service() {
-    let _ = std::process::Command::new("systemctl").args(["--user", "stop", "mbhub"]).status();
-    let _ = std::process::Command::new("systemctl").args(["--user", "disable", "mbhub"]).status();
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "stop", "mbhub"])
+        .status();
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "disable", "mbhub"])
+        .status();
     if let Ok(home) = std::env::var("HOME") {
-        let _ = std::fs::remove_file(
-            PathBuf::from(&home).join(".config/systemd/user/mbhub.service"),
-        );
+        let _ =
+            std::fs::remove_file(PathBuf::from(&home).join(".config/systemd/user/mbhub.service"));
     }
-    let _ = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status();
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status();
 }
 
 /// Stops the CMS sync units and removes them plus the cms symlink.
@@ -273,7 +290,9 @@ fn stop_and_remove_cms_sync() -> bool {
             }
         }
     }
-    let _ = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status();
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status();
     let _ = std::fs::remove_file(home_mbhub().join("cms"));
     ok
 }
@@ -281,7 +300,9 @@ fn stop_and_remove_cms_sync() -> bool {
 /// Removes the `# MBHub binary PATH` marker + its export line from the
 /// user's shell rc files. Returns the number of lines removed.
 fn clean_rc_files() -> usize {
-    let Ok(home) = std::env::var("HOME") else { return 0 };
+    let Ok(home) = std::env::var("HOME") else {
+        return 0;
+    };
     let mut removed = 0;
     for rc in [".bashrc", ".zshrc", ".profile"] {
         let path = PathBuf::from(&home).join(rc);
@@ -336,7 +357,9 @@ fn remove_mcp_entry(path: &PathBuf) -> bool {
 /// Removes the mbhub entry from every known MCP config. Returns how many
 /// configs were touched.
 fn remove_mcp_entries() -> usize {
-    let Ok(home) = std::env::var("HOME") else { return 0 };
+    let Ok(home) = std::env::var("HOME") else {
+        return 0;
+    };
     let mut touched = 0;
     for path in [
         PathBuf::from(&home).join(".config/Claude/claude_desktop_config.json"),
@@ -353,7 +376,9 @@ fn remove_mcp_entries() -> usize {
 /// alive (unlink of a mapped binary is legal). On Windows the binary is
 /// renamed out of the way instead, since a running image cannot be deleted.
 fn remove_self_binary() -> bool {
-    let Ok(exe) = std::env::current_exe() else { return false };
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
     #[cfg(target_os = "windows")]
     {
         let renamed = exe.with_extension(format!("old.{}", std::process::id()));
@@ -436,7 +461,12 @@ fn draw(frame: &mut Frame, app: &UninstallApp, list_state: &mut ListState) {
                 .map(|(idx, item)| {
                     let selected = idx == app.selected;
                     let check = if item.checked {
-                        Span::styled("[x] ", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))
+                        Span::styled(
+                            "[x] ",
+                            Style::default()
+                                .fg(theme::ACCENT)
+                                .add_modifier(Modifier::BOLD),
+                        )
                     } else {
                         Span::styled("[ ] ", Style::default().fg(Color::DarkGray))
                     };
@@ -449,12 +479,20 @@ fn draw(frame: &mut Frame, app: &UninstallApp, list_state: &mut ListState) {
                         check,
                         Span::styled(item.label.to_string(), label_style),
                         Span::raw("  "),
-                        Span::styled(item.detail.to_string(), Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            item.detail.to_string(),
+                            Style::default().fg(Color::DarkGray),
+                        ),
                     ];
                     if selected {
                         spans.insert(
                             0,
-                            Span::styled("> ", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+                            Span::styled(
+                                "> ",
+                                Style::default()
+                                    .fg(theme::ACCENT)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
                         );
                     }
                     ListItem::new(Line::from(spans))
@@ -473,7 +511,11 @@ fn draw(frame: &mut Frame, app: &UninstallApp, list_state: &mut ListState) {
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(theme::ACCENT))
                         .title(title)
-                        .title_style(Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
+                        .title_style(
+                            Style::default()
+                                .fg(theme::ACCENT)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                 )
                 .highlight_style(Style::default().bg(Color::Rgb(40, 46, 58)));
             frame.render_stateful_widget(list, area, list_state);
@@ -497,16 +539,26 @@ fn draw(frame: &mut Frame, app: &UninstallApp, list_state: &mut ListState) {
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                     )),
                     Line::from(Span::styled(
-                        if remove.is_empty() { "—".to_string() } else { remove.join(" · ") },
+                        if remove.is_empty() {
+                            "—".to_string()
+                        } else {
+                            remove.join(" · ")
+                        },
                         Style::default().fg(Color::White),
                     )),
                     Line::from(""),
                     Line::from(Span::styled(
                         "WILL KEEP:",
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
                     )),
                     Line::from(Span::styled(
-                        if keep.is_empty() { "—".to_string() } else { keep.join(" · ") },
+                        if keep.is_empty() {
+                            "—".to_string()
+                        } else {
+                            keep.join(" · ")
+                        },
                         Style::default().fg(Color::White),
                     )),
                     Line::from(""),
@@ -534,7 +586,9 @@ fn draw(frame: &mut Frame, app: &UninstallApp, list_state: &mut ListState) {
         View::Done => {
             let mut lines = vec![Line::from(Span::styled(
                 "Uninstall complete.",
-                Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
             ))];
             for (label, ok) in &app.results {
                 let mark = if *ok {
@@ -567,7 +621,11 @@ fn draw(frame: &mut Frame, app: &UninstallApp, list_state: &mut ListState) {
     }
 }
 
-fn centered_rect(area: ratatui::layout::Rect, percent_x: u16, percent_y: u16) -> ratatui::layout::Rect {
+fn centered_rect(
+    area: ratatui::layout::Rect,
+    percent_x: u16,
+    percent_y: u16,
+) -> ratatui::layout::Rect {
     use ratatui::layout::{Constraint, Layout};
     let vert = Layout::vertical([
         Constraint::Percentage((100 - percent_y) / 2),

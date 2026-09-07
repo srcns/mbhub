@@ -6,8 +6,8 @@
 //! - Accepts incoming gossip inferences and stores verified knowledge.
 //! - Listens on local IPC socket (`~/.mbhub/mbhub.sock`) for local CLI/MCP requests.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -23,7 +23,9 @@ pub fn run_daemon(accept_terms: bool) -> std::io::Result<()> {
 
     if crate::db::get_meta("terms_accepted") != Some("true".to_string()) {
         eprintln!("Error: MBHub Terms of Service have not been accepted yet.");
-        eprintln!("Please launch `mbhub` once in your terminal to review and accept the Terms of Service, or run `mbhub daemon --accept-terms`.");
+        eprintln!(
+            "Please launch `mbhub` once in your terminal to review and accept the Terms of Service, or run `mbhub daemon --accept-terms`."
+        );
         std::process::exit(1);
     }
 
@@ -32,7 +34,8 @@ pub fn run_daemon(accept_terms: bool) -> std::io::Result<()> {
     // Enforce storage quota at startup
     let settings = Settings::load();
     let locality_first = settings.sharding_mode == ShardingMode::QueryLocality;
-    let _ = crate::db::enforce_storage_limit_gb(settings.reserved_gb, locality_first);
+    let reserved_gb = settings.reserved_gb;
+    let _ = crate::db::enforce_storage_limit_gb(reserved_gb, locality_first);
 
     // Initialize P2P Swarm Network
     let p2p = Arc::new(crate::p2p::start_p2p_service());
@@ -41,6 +44,61 @@ pub fn run_daemon(accept_terms: bool) -> std::io::Result<()> {
     let running = Arc::new(AtomicBool::new(true));
 
     eprintln!("MBHub daemon active and listening on IPC socket.");
+
+    // Self-update maintenance (hardening): check the public release manifest
+    // periodically so installed clients never require manual attention. When
+    // a newer version passes the mandatory SHA-256 verification, the binary
+    // is replaced atomically and this daemon exits — the system supervisor
+    // (systemd / launchd / Task Scheduler) immediately restarts it into the
+    // new build. Zero cost: two HTTPS GETs per cycle. Opt out with
+    // MBHUB_AUTO_UPDATE=0. Publisher builds never self-update.
+    {
+        let running = running.clone();
+        thread::spawn(move || {
+            if cfg!(feature = "publisher") {
+                return;
+            }
+            let auto_enabled = std::env::var("MBHUB_AUTO_UPDATE")
+                .map(|v| v.trim() != "0")
+                .unwrap_or(true);
+            if !auto_enabled {
+                eprintln!("[daemon] automatic updates disabled via MBHUB_AUTO_UPDATE=0.");
+                return;
+            }
+            // First check shortly after boot, then every 6 hours, forever —
+            // the thread lives as long as the daemon does.
+            let mut first_check = true;
+            loop {
+                let wait = if first_check {
+                    first_check = false;
+                    Duration::from_secs(1800)
+                } else {
+                    Duration::from_secs(6 * 3600)
+                };
+                thread::sleep(wait);
+                match crate::update::check_latest() {
+                    Ok(Some(version)) => {
+                        eprintln!(
+                            "[daemon] new MBHub version v{version} available — applying verified self-update..."
+                        );
+                        match crate::update::apply_update() {
+                            Ok(()) => {
+                                eprintln!("[daemon] updated to v{version}. Restarting service...");
+                                running.store(false, Ordering::Relaxed);
+                                return;
+                            }
+                            Err(e) => eprintln!("[daemon] self-update failed: {e}"),
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => { /* offline or manifest unreachable — retry next cycle */ }
+                }
+                if !running.load(Ordering::Relaxed) {
+                    return;
+                }
+            }
+        });
+    }
 
     // Worker thread for P2P inbound gossip digestion
     let p2p_bg = p2p.clone();
@@ -76,6 +134,12 @@ pub fn run_daemon(accept_terms: bool) -> std::io::Result<()> {
                     );
                 }
             }
+
+            // Storage quota per drain pass (hardening): the ceiling was
+            // previously enforced only at startup, so a write flood could
+            // grow the store unboundedly until the next restart. The call
+            // early-returns while under the cap — near-zero cost.
+            let _ = crate::db::enforce_storage_limit_gb(reserved_gb, locality_first);
 
             // 2. Drain inbound tombstones (negative signals)
             while let Ok(tomb) = p2p_bg.inbound_tombstone_rx.try_recv() {

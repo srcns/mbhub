@@ -5,10 +5,10 @@
 //! painted over the *existing* two-space gaps (one column into each side), so
 //! switching screens never shifts the labels.
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::app::{App, Screen};
 use crate::theme;
@@ -30,11 +30,17 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
 
     if app.tos_gate_active {
         let mut spans = Vec::new();
-        spans.push(Span::styled(" [ Enter / Y : Accept & Connect ] ", theme::footer_active()));
+        spans.push(Span::styled(
+            " [ Enter / Y : Accept & Connect ] ",
+            theme::footer_active(),
+        ));
         spans.push(Span::styled("  ", base));
         spans.push(Span::styled(" [ Esc / Q : Decline & Exit ] ", base));
         spans.push(Span::styled("  ", base));
-        spans.push(Span::styled(" ↑/↓/PgUp/PgDn/Space : Scroll agreement ", base));
+        spans.push(Span::styled(
+            " ↑/↓/PgUp/PgDn/Space : Scroll agreement ",
+            base,
+        ));
         let p = Paragraph::new(Line::from(spans)).style(base);
         frame.render_widget(p, area);
         return;
@@ -70,9 +76,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
     spans.push(Span::styled(" ", base));
 
     // Fill the remainder of the bar so the green ground spans the full width.
-    let used = hint.len()
-        + (LABELS.len() + 1) * 2
-        + LABELS.iter().map(|l| l.len()).sum::<usize>();
+    let used = hint.len() + (LABELS.len() + 1) * 2 + LABELS.iter().map(|l| l.len()).sum::<usize>();
     let width = area.width as usize;
 
     if used < width {

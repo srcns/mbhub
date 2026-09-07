@@ -8,9 +8,9 @@
 //! symlink-following attacks) and the file is locked to owner-only (0600) on
 //! Unix, repaired on load when permissions have drifted.
 
+use libp2p::identity::Keypair;
 use std::fs;
 use std::path::PathBuf;
-use libp2p::identity::Keypair;
 
 pub fn load_or_generate_keypair() -> Keypair {
     if let Some(path) = identity_path() {
@@ -80,9 +80,8 @@ fn write_identity_atomically(path: &PathBuf, bytes: &[u8]) -> std::io::Result<()
             Err(e) => return Err(e),
         }
     }
-    Err(last_err.unwrap_or_else(|| {
-        std::io::Error::other("could not create a unique identity temp file")
-    }))
+    Err(last_err
+        .unwrap_or_else(|| std::io::Error::other("could not create a unique identity temp file")))
 }
 
 /// Opens a brand-new file for exclusive writing with owner-only (0600)
@@ -163,7 +162,10 @@ mod tests {
 
     #[test]
     fn symlink_at_destination_is_replaced_not_followed() {
-        let dir = std::env::temp_dir().join(format!("mbhub_identity_symlink_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "mbhub_identity_symlink_test_{}",
+            std::process::id()
+        ));
         let victim = dir.join("victim.txt");
         let path = dir.join("node_identity.bin");
         let _ = fs::remove_dir_all(&dir);
@@ -177,7 +179,12 @@ mod tests {
 
             // Victim file untouched; destination is now a regular file.
             assert_eq!(fs::read(&victim).unwrap(), b"PRECIOUS DATA");
-            assert!(!fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+            assert!(
+                !fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
             assert_eq!(fs::read(&path).unwrap(), b"KEY BYTES");
         }
 
@@ -202,7 +209,11 @@ mod tests {
         // direct (symlink-following, non-atomic) write of the destination.
         write_identity_atomically(&path, b"KEY BYTES").expect("writes via the next temp attempt");
 
-        assert_eq!(fs::read(&planted).unwrap(), b"PLANTED", "planted temp must not be touched");
+        assert_eq!(
+            fs::read(&planted).unwrap(),
+            b"PLANTED",
+            "planted temp must not be touched"
+        );
         assert_eq!(fs::read(&path).unwrap(), b"KEY BYTES");
 
         // No temp leftovers remain next to the identity file.
@@ -213,7 +224,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|name| *name != "node_identity.bin" && *name != planted_name)
             .collect();
-        assert!(leftovers.is_empty(), "unexpected files left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "unexpected files left behind: {leftovers:?}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

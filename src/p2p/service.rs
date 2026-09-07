@@ -27,7 +27,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use libp2p::futures::StreamExt;
 use libp2p::gossipsub::{self, IdentTopic};
 use libp2p::swarm::SwarmEvent;
@@ -37,9 +37,9 @@ use crate::p2p::behaviour::{MbHubBehaviour, MbHubBehaviourEvent};
 use crate::p2p::bootstrap::{self, BootstrapSource};
 use crate::p2p::identity::load_or_generate_keypair;
 use crate::p2p::protocol::{
-    SwarmInferenceMessage, SwarmQueryRequest, SwarmQueryResponse, SwarmTombstoneMessage,
     GOSSIP_TOPIC_INFERENCES, GOSSIP_TOPIC_QUERIES, GOSSIP_TOPIC_RESPONSES, GOSSIP_TOPIC_TOMBSTONES,
-    MAX_GOSSIP_PAYLOAD,
+    MAX_GOSSIP_PAYLOAD, SwarmInferenceMessage, SwarmQueryRequest, SwarmQueryResponse,
+    SwarmTombstoneMessage,
 };
 
 /// Max gossip messages accepted per peer per second. Honest clients are far
@@ -209,6 +209,17 @@ impl P2pHandle {
     }
 }
 
+/// Aggregate node-wide ingress cap. Per-author limits (below) are Sybil-
+/// multipliable because Ed25519 identities are free; this second layer
+/// bounds TOTAL message processing per second regardless of identity count.
+/// Generous by design: an honest peer emits at most a few messages/second.
+pub const MAX_MSGS_NODEWIDE_PER_SEC: u32 = 120;
+
+/// Sliding-window counter backing the node-wide cap. The swarm loop is
+/// single-threaded, so the uncontended mutex costs effectively nothing.
+static NODE_INGRESS_RATE: std::sync::LazyLock<std::sync::Mutex<PeerRate>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(PeerRate::new(Instant::now())));
+
 /// A gossip publish that failed because the mesh had not settled yet, kept
 /// for a bounded retry window (see [`PUBLISH_RETRY_WINDOW`]).
 struct PendingPublish {
@@ -231,13 +242,13 @@ impl PeerRate {
         }
     }
 
-    /// Returns true when the message may be accepted (rate within limit).
-    fn allow(&mut self, now: Instant) -> bool {
+    /// Returns true when the message may be accepted (rate within `limit`).
+    fn allow(&mut self, now: Instant, limit: u32) -> bool {
         if now.duration_since(self.window_start) >= Duration::from_secs(1) {
             self.window_start = now;
             self.count = 0;
         }
-        if self.count >= MAX_MSGS_PER_PEER_PER_SEC {
+        if self.count >= limit {
             return false;
         }
         self.count += 1;
@@ -257,10 +268,11 @@ fn listen_port() -> u16 {
 /// True when the multiaddr embeds a globally routable (public) IP.
 ///
 /// Used to decide whether an identify-observed external address candidate may
-/// be confirmed. Loopback, link-local, private, CGNAT and multicast ranges
+/// be confirmed. Loopback, private, CGNAT, link-local and multicast ranges
 /// are rejected: advertising them to the WAN DHT would poison other peers'
 /// routing tables, and LAN reachability is already covered by mDNS.
-fn is_public_candidate(addr: &Multiaddr) -> bool {
+/// Addresses without an IP component (DNS, websocket hostnames) pass.
+pub(crate) fn is_public_candidate(addr: &Multiaddr) -> bool {
     use libp2p::multiaddr::Protocol;
     for proto in addr.iter() {
         match proto {
@@ -314,33 +326,37 @@ fn is_public_candidate(addr: &Multiaddr) -> bool {
 fn build_swarm(
     keypair: &libp2p::identity::Keypair,
 ) -> Result<libp2p::Swarm<MbHubBehaviour>, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
-        .with_tokio()
-        .with_tcp(
-            libp2p::tcp::Config::default(),
-            libp2p::noise::Config::new,
-            libp2p::yamux::Config::default,
-        )?
-        // Relay client transport: dialing /p2p-circuit addresses falls back
-        // to circuit relay v2 when direct dialing is impossible (hard NAT).
-        .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
-        .with_behaviour(|keypair, relay_client| MbHubBehaviour::new(keypair, relay_client))?
-        .with_swarm_config(|c| {
-            // libp2p 0.56 closes connections after 10 s without open streams.
-            // Between swarm bursts (bootstrap, queries) that idle-kill made
-            // PEERS collapse to 0 and the L2 gate skip the swarm entirely.
-            // 600 s keeps the mesh warm: the 5/10-min kad re-bootstraps always
-            // land inside the window, so peers stay continuously reachable.
-            c.with_idle_connection_timeout(Duration::from_secs(600))
-        })
-        .build())
+    Ok(
+        libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
+            .with_tokio()
+            .with_tcp(
+                libp2p::tcp::Config::default(),
+                libp2p::noise::Config::new,
+                libp2p::yamux::Config::default,
+            )?
+            // Relay client transport: dialing /p2p-circuit addresses falls back
+            // to circuit relay v2 when direct dialing is impossible (hard NAT).
+            .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
+            .with_behaviour(|keypair, relay_client| MbHubBehaviour::new(keypair, relay_client))?
+            .with_swarm_config(|c| {
+                // libp2p 0.56 closes connections after 10 s without open streams.
+                // Between swarm bursts (bootstrap, queries) that idle-kill made
+                // PEERS collapse to 0 and the L2 gate skip the swarm entirely.
+                // 600 s keeps the mesh warm: the 5/10-min kad re-bootstraps always
+                // land inside the window, so peers stay continuously reachable.
+                c.with_idle_connection_timeout(Duration::from_secs(600))
+            })
+            .build(),
+    )
 }
 
 /// Binds the swarm listener: fixed port first, ephemeral fallback when the
 /// port is already taken (two instances on one machine).
 fn bind_listener(swarm: &mut libp2p::Swarm<MbHubBehaviour>) {
     let port = listen_port();
-    let primary: Multiaddr = format!("/ip4/0.0.0.0/tcp/{port}").parse().expect("valid addr");
+    let primary: Multiaddr = format!("/ip4/0.0.0.0/tcp/{port}")
+        .parse()
+        .expect("valid addr");
     match swarm.listen_on(primary.clone()) {
         Ok(_) => {
             log_line(&format!("[MBHub P2P] listening on {primary}"));
@@ -403,7 +419,10 @@ fn dial_bootstrap_peers(swarm: &mut libp2p::Swarm<MbHubBehaviour>) {
         // Seed the DHT routing table before bootstrapping so the first
         // FIND_NODE query has somewhere to go.
         if let Some(peer_id) = peer_id_of(addr) {
-            swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+            swarm
+                .behaviour_mut()
+                .kad
+                .add_address(&peer_id, addr.clone());
         }
         if let Err(e) = swarm.dial(addr.clone()) {
             log_line(&format!("[MBHub P2P] bootstrap dial failed {addr}: {e}"));
@@ -415,7 +434,9 @@ fn dial_bootstrap_peers(swarm: &mut libp2p::Swarm<MbHubBehaviour>) {
             log_line("[MBHub P2P] Kademlia bootstrap query started");
         }
         Err(e) => {
-            log_line(&format!("[MBHub P2P] Kademlia bootstrap not possible yet: {e}"));
+            log_line(&format!(
+                "[MBHub P2P] Kademlia bootstrap not possible yet: {e}"
+            ));
         }
     }
 }
@@ -501,7 +522,9 @@ async fn run_swarm_loop(
         s.peer_id = my_peer_id_str.clone();
     }
 
-    log_line(&format!("[MBHub P2P] node started — peer id: {my_peer_id_str}"));
+    log_line(&format!(
+        "[MBHub P2P] node started — peer id: {my_peer_id_str}"
+    ));
 
     let mut swarm = match build_swarm(&keypair) {
         Ok(s) => s,
@@ -513,10 +536,16 @@ async fn run_swarm_loop(
 
     let topics = GossipTopics::new();
 
-    let _ = swarm.behaviour_mut().gossipsub.subscribe(&topics.inferences);
+    let _ = swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&topics.inferences);
     let _ = swarm.behaviour_mut().gossipsub.subscribe(&topics.queries);
     let _ = swarm.behaviour_mut().gossipsub.subscribe(&topics.responses);
-    let _ = swarm.behaviour_mut().gossipsub.subscribe(&topics.tombstones);
+    let _ = swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&topics.tombstones);
 
     bind_listener(&mut swarm);
     dial_bootstrap_peers(&mut swarm);
@@ -561,6 +590,11 @@ async fn run_swarm_loop(
                             &msg.content_hash,
                         );
                     }
+                    // Author signature (v1.0.1): binds every integrity field
+                    // to this node's identity — poisoning becomes attributable.
+                    if msg.signature.is_empty() {
+                        msg.sign_with(&keypair);
+                    }
                     if let Ok(json_bytes) = serde_json::to_vec(&msg) {
                         if json_bytes.len() <= MAX_GOSSIP_PAYLOAD {
                             enqueue_or_publish(
@@ -574,10 +608,13 @@ async fn run_swarm_loop(
                 }
 
                 // Drain outbound queries
-                while let Ok(req) = outbound_query_rx.try_recv() {
+                while let Ok(mut req) = outbound_query_rx.try_recv() {
                     if req.question.trim().is_empty() || req.question.trim().len() < 3 {
                         continue;
                     }
+                    // Asker signature (v1.0.1): query spam becomes attributable
+                    // and ban-able at every receiving edge.
+                    req.sign_with(&keypair);
                     if let Ok(json_bytes) = serde_json::to_vec(&req) {
                         if json_bytes.len() <= MAX_GOSSIP_PAYLOAD {
                             enqueue_or_publish(
@@ -591,7 +628,7 @@ async fn run_swarm_loop(
                 }
 
                 // Drain outbound responses
-                while let Ok(resp) = outbound_resp_rx.try_recv() {
+                while let Ok(mut resp) = outbound_resp_rx.try_recv() {
                     // Anti-Poison Hard Gate: defense-in-depth gate before wire transmission
                     if resp.content.trim().is_empty()
                         || resp.content.trim().len() < 10
@@ -600,6 +637,9 @@ async fn run_swarm_loop(
                     {
                         continue;
                     }
+                    // Response seal (v1.0.1): PoW + responder signature close
+                    // the zero-cost injection route through this channel.
+                    resp.seal_with(&keypair);
                     if let Ok(json_bytes) = serde_json::to_vec(&resp) {
                         if json_bytes.len() <= MAX_GOSSIP_PAYLOAD {
                             enqueue_or_publish(
@@ -717,6 +757,7 @@ async fn run_swarm_loop(
                     &mut swarm,
                     &status,
                     &my_peer_id_str,
+                    &keypair,
                     &mut peer_rates,
                     &mut peer_keys,
                     &mut connected_set,
@@ -759,7 +800,11 @@ fn enqueue_or_publish(
     topic: IdentTopic,
     payload: Vec<u8>,
 ) {
-    match swarm.behaviour_mut().gossipsub.publish(topic.clone(), payload.clone()) {
+    match swarm
+        .behaviour_mut()
+        .gossipsub
+        .publish(topic.clone(), payload.clone())
+    {
         Ok(_) => {}
         Err(gossipsub::PublishError::Duplicate) => {}
         Err(e) if is_retryable_publish_error(&e) => {
@@ -782,6 +827,7 @@ fn handle_swarm_event(
     swarm: &mut libp2p::Swarm<MbHubBehaviour>,
     status: &Arc<RwLock<P2pStatus>>,
     my_peer_id_str: &str,
+    local_keypair: &libp2p::identity::Keypair,
     peer_rates: &mut HashMap<PeerId, PeerRate>,
     peer_keys: &mut HashMap<PeerId, libp2p::identity::PublicKey>,
     connected_set: &mut HashSet<PeerId>,
@@ -863,7 +909,9 @@ fn handle_swarm_event(
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             log_line(&format!(
                 "[MBHub P2P] outgoing dial failed to {}: {error}",
-                peer_id.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into())
+                peer_id
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "unknown".into())
             ));
         }
         SwarmEvent::Behaviour(behaviour_event) => {
@@ -872,6 +920,7 @@ fn handle_swarm_event(
                 swarm,
                 status,
                 my_peer_id_str,
+                local_keypair,
                 peer_rates,
                 peer_keys,
                 pending_publishes,
@@ -892,6 +941,7 @@ fn handle_behaviour_event(
     swarm: &mut libp2p::Swarm<MbHubBehaviour>,
     status: &Arc<RwLock<P2pStatus>>,
     my_peer_id_str: &str,
+    local_keypair: &libp2p::identity::Keypair,
     peer_rates: &mut HashMap<PeerId, PeerRate>,
     peer_keys: &mut HashMap<PeerId, libp2p::identity::PublicKey>,
     pending_publishes: &mut VecDeque<PendingPublish>,
@@ -906,6 +956,7 @@ fn handle_behaviour_event(
                 message,
                 swarm,
                 my_peer_id_str,
+                local_keypair,
                 peer_rates,
                 peer_keys,
                 pending_publishes,
@@ -922,40 +973,41 @@ fn handle_behaviour_event(
             peer_id, info, ..
         }) => {
             peer_keys.insert(peer_id, info.public_key.clone());
-            // Feed every non-loopback listen address into the DHT routing
-            // table: this is how "every peer introduces every other peer".
+            // Feed only globally-routable listen addresses into the DHT
+            // routing table: this is how "every peer introduces every other
+            // peer". A malicious identify payload advertising private-range,
+            // CGNAT or link-local addresses would otherwise poison routing
+            // tables and make other peers dial unroutable or victim IPs
+            // (audit: routing-table poisoning / dial-back amplification).
+            // DNS/websocket addresses carry no IP and pass the screener.
             for addr in &info.listen_addrs {
-                if addr.iter().any(|p| {
-                    matches!(p, libp2p::multiaddr::Protocol::Ip4(ip) if ip.is_loopback())
-                        || matches!(p, libp2p::multiaddr::Protocol::Ip6(ip) if ip.is_loopback())
-                }) {
+                if !is_public_candidate(addr) {
                     continue;
                 }
-                swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                swarm
+                    .behaviour_mut()
+                    .kad
+                    .add_address(&peer_id, addr.clone());
             }
         }
         MbHubBehaviourEvent::Kad(libp2p::kad::Event::OutboundQueryProgressed {
             result, ..
-        }) => {
-            match result {
-                libp2p::kad::QueryResult::Bootstrap(Ok(ok)) => {
-                    if ok.num_remaining == 0 {
-                        log_line(&format!(
-                            "[MBHub P2P] Kademlia bootstrap complete via {}",
-                            ok.peer
-                        ));
-                    }
+        }) => match result {
+            libp2p::kad::QueryResult::Bootstrap(Ok(ok)) => {
+                if ok.num_remaining == 0 {
+                    log_line(&format!(
+                        "[MBHub P2P] Kademlia bootstrap complete via {}",
+                        ok.peer
+                    ));
                 }
-                libp2p::kad::QueryResult::Bootstrap(Err(e)) => {
-                    log_line(&format!("[MBHub P2P] Kademlia bootstrap failed: {e}"));
-                }
-                _ => {}
             }
-        }
+            libp2p::kad::QueryResult::Bootstrap(Err(e)) => {
+                log_line(&format!("[MBHub P2P] Kademlia bootstrap failed: {e}"));
+            }
+            _ => {}
+        },
         MbHubBehaviourEvent::Kad(libp2p::kad::Event::RoutingUpdated {
-            peer,
-            is_new_peer,
-            ..
+            peer, is_new_peer, ..
         }) => {
             if is_new_peer {
                 log_line(&format!("[MBHub P2P] DHT routing table: +{peer}"));
@@ -994,17 +1046,23 @@ fn handle_behaviour_event(
                 }
             }
         }
-        MbHubBehaviourEvent::RelayClient(libp2p::relay::client::Event::ReservationReqAccepted {
-            relay_peer_id,
-            renewal,
-            ..
-        }) => {
+        MbHubBehaviourEvent::RelayClient(
+            libp2p::relay::client::Event::ReservationReqAccepted {
+                relay_peer_id,
+                renewal,
+                ..
+            },
+        ) => {
             log_line(&format!(
                 "[MBHub P2P] relay reservation accepted by {relay_peer_id} (renewal: {renewal})"
             ));
         }
         MbHubBehaviourEvent::Dcutr(event) => {
-            log_line(&format!("[MBHub P2P] DCUtR hole punch: {} → {:?}", event.remote_peer_id, event.result.map(|_| ()).map_err(|e| e.to_string())));
+            log_line(&format!(
+                "[MBHub P2P] DCUtR hole punch: {} → {:?}",
+                event.remote_peer_id,
+                event.result.map(|_| ()).map_err(|e| e.to_string())
+            ));
         }
         MbHubBehaviourEvent::Upnp(libp2p::upnp::Event::NewExternalAddr(addr)) => {
             log_line(&format!("[MBHub P2P] UPnP port mapping active: {addr}"));
@@ -1033,6 +1091,7 @@ fn handle_gossip_message(
     message: gossipsub::Message,
     swarm: &mut libp2p::Swarm<MbHubBehaviour>,
     my_peer_id_str: &str,
+    local_keypair: &libp2p::identity::Keypair,
     peer_rates: &mut HashMap<PeerId, PeerRate>,
     peer_keys: &mut HashMap<PeerId, libp2p::identity::PublicKey>,
     _pending_publishes: &mut VecDeque<PendingPublish>,
@@ -1051,19 +1110,46 @@ fn handle_gossip_message(
     // single peer are dropped unprocessed.
     if let Some(source) = message.source {
         let now = Instant::now();
-        let rate = peer_rates.entry(source).or_insert_with(|| PeerRate::new(now));
-        if !rate.allow(now) {
+        let rate = peer_rates
+            .entry(source)
+            .or_insert_with(|| PeerRate::new(now));
+        if !rate.allow(now, MAX_MSGS_PER_PEER_PER_SEC) {
             return;
         }
     }
 
+    // Node-wide aggregate cap (Sybil defense layer 2): a flood from many free
+    // identities through one connection keeps every per-author counter green,
+    // so TOTAL ingress is bounded here too. Fail closed on lock poisoning.
+    match NODE_INGRESS_RATE.lock() {
+        Ok(mut global) => {
+            if !global.allow(Instant::now(), MAX_MSGS_NODEWIDE_PER_SEC) {
+                return;
+            }
+        }
+        Err(_) => return,
+    }
+
     if message.topic == topics.queries.hash() {
         if let Ok(query_req) = serde_json::from_slice::<SwarmQueryRequest>(&message.data) {
+            // Signature gate (v1.0.1): queries must be signed by their gossip
+            // author — query spam becomes attributable and ban-able.
+            let sig_ok = message
+                .source
+                .as_ref()
+                .and_then(|src| peer_keys.get(src))
+                .map(|pk| pk.verify(&query_req.signing_payload(), &query_req.signature))
+                .unwrap_or(false);
+            if !sig_ok {
+                log_line("[MBHub P2P] dropped query: invalid/missing asker signature");
+                return;
+            }
             // Only respond to peers' queries, never to our own echoes.
             if query_req.asker_peer_id != my_peer_id_str && query_req.passes_integrity_checks() {
-                if let Some(hit) =
-                    crate::db::find_best_match_by_hash(query_req.simhash, query_req.min_similarity)
-                {
+                if let Some(hit) = crate::db::find_best_served_match_by_hash(
+                    query_req.simhash,
+                    query_req.min_similarity,
+                ) {
                     // Honest self-regulation (§5.1): never serve records lacking a valid content hash,
                     // or records with empty/short/truncated content (Anti-Poison Hard Gate).
                     if !hit.content_hash.is_empty()
@@ -1073,7 +1159,7 @@ fn handle_gossip_message(
                         && hit.question.trim().len() >= 3
                         && !hit.is_truncated
                     {
-                        let resp = SwarmQueryResponse {
+                        let mut resp = SwarmQueryResponse {
                             request_id: query_req.request_id,
                             responder_peer_id: my_peer_id_str.to_string(),
                             question: hit.question,
@@ -1082,7 +1168,12 @@ fn handle_gossip_message(
                             provider: hit.provider,
                             model: hit.model,
                             content_hash: hit.content_hash,
+                            pow: String::new(),
+                            signature: Vec::new(),
                         };
+                        // Response seal (v1.0.1): PoW + responder signature
+                        // close the zero-cost injection route.
+                        resp.seal_with(local_keypair);
                         if let Ok(bytes) = serde_json::to_vec(&resp) {
                             if bytes.len() <= MAX_GOSSIP_PAYLOAD {
                                 enqueue_or_publish(
@@ -1099,6 +1190,28 @@ fn handle_gossip_message(
         }
     } else if message.topic == topics.responses.hash() {
         if let Ok(query_resp) = serde_json::from_slice::<SwarmQueryResponse>(&message.data) {
+            // Signature + response-PoW gate (v1.0.1): a response must be
+            // signed by its gossip author and carry valid work over its
+            // content hash — the query-response channel can no longer be a
+            // zero-cost content injection route.
+            let seal_ok = message
+                .source
+                .as_ref()
+                .and_then(|src| peer_keys.get(src))
+                .map(|pk| {
+                    pk.verify(&query_resp.signing_payload(), &query_resp.signature)
+                        && crate::p2p::protocol::verify_publish_pow(
+                            &pk.encode_protobuf(),
+                            &query_resp.content_hash,
+                            &query_resp.pow,
+                            crate::p2p::protocol::RESPONSE_POW_DIFFICULTY_BITS,
+                        )
+                })
+                .unwrap_or(false);
+            if !seal_ok {
+                log_line("[MBHub P2P] dropped response: invalid signature or response PoW");
+                return;
+            }
             // Anti-Poison Hard Gate: drop answerless / empty / short responses immediately
             if !query_resp.content.trim().is_empty()
                 && query_resp.content.trim().len() >= 10
@@ -1151,6 +1264,20 @@ fn handle_gossip_message(
             if !pow_ok {
                 log_line(&format!(
                     "[MBHub P2P] dropped inference from {source}: invalid/missing publish PoW"
+                ));
+                return;
+            }
+            // Attribution signature gate (v1.0.1 major upgrade): the record
+            // must be signed by its gossip author over every integrity-
+            // relevant field. Poisoned content is now attributable, ban-able
+            // evidence — and unsigned records are dropped at the edge.
+            let sig_ok = peer_keys
+                .get(&source)
+                .map(|pk| pk.verify(&inference.signing_payload(), &inference.signature))
+                .unwrap_or(false);
+            if !sig_ok {
+                log_line(&format!(
+                    "[MBHub P2P] dropped inference from {source}: invalid/missing author signature"
                 ));
                 return;
             }
@@ -1253,7 +1380,10 @@ mod tests {
         let content = std::fs::read_to_string(&path).expect("log file created");
         assert!(content.contains("test line one"));
         assert!(content.contains("test line two"));
-        assert!(content.lines().all(|l| l.starts_with('[')), "timestamped lines");
+        assert!(
+            content.lines().all(|l| l.starts_with('[')),
+            "timestamped lines"
+        );
 
         // Size cap: force a huge line, next write truncates the log.
         std::fs::write(&path, "x".repeat((MAX_LOG_BYTES + 100) as usize)).unwrap();
@@ -1285,9 +1415,10 @@ mod tests {
             &gossipsub::PublishError::MessageTooLarge
         ));
         assert!(!is_retryable_publish_error(
-            &gossipsub::PublishError::TransformFailed(
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "x")
-            )
+            &gossipsub::PublishError::TransformFailed(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "x"
+            ))
         ));
     }
 
@@ -1413,11 +1544,14 @@ mod tests {
                 hop_ttl: MAX_HOP_TTL,
                 is_truncated: false,
                 pow: String::new(),
+                signature: Vec::new(),
                 author_peer_id: String::new(),
             };
             msg.content_hash = msg.canonical_content_hash();
             // The receiver enforces the publish proof-of-work gate.
             msg.pow = crate::p2p::protocol::solve_publish_pow(&keypair_b.public().encode_protobuf(), &msg.content_hash);
+            // v1.0.1 wire contract: the author signature is mandatory.
+            msg.sign_with(&keypair_b);
             let payload = serde_json::to_vec(&msg).expect("serializes");
 
             // GossipSub mesh membership settles a heartbeat or two after the
@@ -1485,7 +1619,9 @@ mod tests {
                 .expect("A listens");
             let port_a = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    if let SwarmEvent::NewListenAddr { address, .. } = swarm_a.select_next_some().await {
+                    if let SwarmEvent::NewListenAddr { address, .. } =
+                        swarm_a.select_next_some().await
+                    {
                         for proto in address.iter() {
                             if let libp2p::multiaddr::Protocol::Tcp(p) = proto {
                                 return p;
@@ -1502,9 +1638,16 @@ mod tests {
                 .unwrap();
 
             // Production bootstrap path: seed the routing table, dial, bootstrap.
-            swarm_b.behaviour_mut().kad.add_address(&peer_a, addr_a.clone());
+            swarm_b
+                .behaviour_mut()
+                .kad
+                .add_address(&peer_a, addr_a.clone());
             swarm_b.dial(addr_a).expect("B dials A");
-            swarm_b.behaviour_mut().kad.bootstrap().expect("B bootstraps");
+            swarm_b
+                .behaviour_mut()
+                .kad
+                .bootstrap()
+                .expect("B bootstraps");
 
             // The bootstrap query must complete without error and A must end
             // up in B's routing table (RoutingUpdated) — that is the exact
@@ -1580,11 +1723,209 @@ mod tests {
 
         // A tampered signature (different key) must not verify.
         let attacker = Keypair::generate_ed25519();
-        assert!(!attacker.public().verify(&parsed.signing_payload(), &parsed.signature));
+        assert!(
+            !attacker
+                .public()
+                .verify(&parsed.signing_payload(), &parsed.signature)
+        );
 
         // An unsigned legacy tombstone is rejected by integrity checks.
         let mut unsigned = parsed.clone();
         unsigned.signature.clear();
         assert!(!unsigned.passes_integrity_checks(chrono::Local::now().timestamp()));
+    }
+
+    /// SECURITY REHEARSAL (temporary, audit-only): drives the REAL production
+    /// inbound gate chain (`handle_gossip_message`) with an attacker keypair
+    /// over every attack class: tampered content, missing PoW, forged author,
+    /// oversized payload, garbage bytes, and a 60-msg flood. Proves the gates
+    /// hold end-to-end and the pipeline never panics.
+    #[test]
+    fn adversarial_rehearsal_production_gates_hold() {
+        // DB isolation for the ban-list gate.
+        let _env_guard = crate::env::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("MBHUB_DB", "mbhub_rehearsal.db");
+            std::env::set_var("MBHUB_ENV_FILE", "mbhub_rehearsal.env");
+        }
+        let _ = std::fs::remove_file("mbhub_rehearsal.db");
+        let _ = crate::db::load_records();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        rt.block_on(async {
+            let attacker = Keypair::generate_ed25519();
+            let attacker_pid = PeerId::from(attacker.public());
+            let attacker_pub = attacker.public();
+            let victim_pid = PeerId::from(Keypair::generate_ed25519().public());
+
+            let mut swarm = build_swarm(&Keypair::generate_ed25519()).expect("swarm builds");
+            let local_kp = Keypair::generate_ed25519();
+            let mut peer_rates: HashMap<PeerId, PeerRate> = HashMap::new();
+            let mut peer_keys: HashMap<PeerId, libp2p::identity::PublicKey> = HashMap::new();
+            peer_keys.insert(attacker_pid, attacker_pub.clone());
+            let topics = GossipTopics::new();
+            let (inf_tx, inf_rx) = crossbeam_channel::unbounded();
+            let (tomb_tx, _tomb_rx) = crossbeam_channel::unbounded();
+            let (resp_tx, _resp_rx) = crossbeam_channel::unbounded();
+            let mut pending: VecDeque<PendingPublish> = VecDeque::new();
+            let my_id = victim_pid.to_string();
+
+            let now = chrono::Local::now().timestamp();
+            let mut valid = SwarmInferenceMessage {
+                question: "How does Byzantine fault tolerance work?".to_string(),
+                content: "Byzantine fault tolerance survives arbitrary malicious nodes via quorum agreement.".to_string(),
+                timestamp: now,
+                simhash: crate::simhash::compute_simhash("How does Byzantine fault tolerance work?"),
+                provider: "OpenAI".to_string(),
+                model: "gpt-4o".to_string(),
+                content_hash: String::new(),
+                hop_ttl: MAX_HOP_TTL,
+                is_truncated: false,
+                pow: String::new(),
+                signature: Vec::new(),
+                author_peer_id: String::new(),
+            };
+            valid.content_hash = valid.canonical_content_hash();
+            valid.pow = crate::p2p::protocol::solve_publish_pow(
+                &attacker_pub.encode_protobuf(),
+                &valid.content_hash,
+            );
+            // v1.0.1 wire contract: the author signature is mandatory.
+            valid.sign_with(&attacker);
+            let valid_bytes = serde_json::to_vec(&valid).expect("serializes");
+
+            let gossip_msg = |data: Vec<u8>| gossipsub::Message {
+                source: Some(attacker_pid),
+                data,
+                sequence_number: None,
+                topic: topics.inferences.hash(),
+            };
+
+            // 1) HONEST BASELINE: a fully valid message MUST be accepted.
+            handle_gossip_message(
+                gossip_msg(valid_bytes.clone()), &mut swarm, &my_id, &local_kp, &mut peer_rates,
+                &mut peer_keys, &mut pending, &topics, inf_tx.clone(), tomb_tx.clone(), resp_tx.clone(),
+            );
+            let got = inf_rx.try_recv().expect("valid inference must be accepted");
+            assert_eq!(got.content_hash, valid.content_hash);
+
+            // 2) TAMPERED CONTENT: hash AND signature bind the original
+            //    payload — a mutated body must never pass either gate.
+            let mut tampered = valid.clone();
+            tampered.content = "TOTALLY DIFFERENT attacker content injected here.".to_string();
+            let tampered_bytes = serde_json::to_vec(&tampered).unwrap();
+            handle_gossip_message(
+                gossip_msg(tampered_bytes), &mut swarm, &my_id, &local_kp, &mut peer_rates,
+                &mut peer_keys, &mut pending, &topics, inf_tx.clone(), tomb_tx.clone(), resp_tx.clone(),
+            );
+            assert!(inf_rx.try_recv().is_err(), "tampered content must be dropped");
+
+            // 3) MISSING PUBLISH PROOF-OF-WORK.
+            let mut nopow = valid.clone();
+            nopow.pow.clear();
+            handle_gossip_message(
+                gossip_msg(serde_json::to_vec(&nopow).unwrap()), &mut swarm, &my_id, &local_kp,
+                &mut peer_rates, &mut peer_keys, &mut pending, &topics,
+                inf_tx.clone(), tomb_tx.clone(), resp_tx.clone(),
+            );
+            assert!(inf_rx.try_recv().is_err(), "message without PoW must be dropped");
+
+            // 3b) MISSING AUTHOR SIGNATURE (v1.0.1 gate).
+            let mut nosig = valid.clone();
+            nosig.signature.clear();
+            handle_gossip_message(
+                gossip_msg(serde_json::to_vec(&nosig).unwrap()), &mut swarm, &my_id, &local_kp,
+                &mut peer_rates, &mut peer_keys, &mut pending, &topics,
+                inf_tx.clone(), tomb_tx.clone(), resp_tx.clone(),
+            );
+            assert!(inf_rx.try_recv().is_err(), "message without signature must be dropped");
+
+            // 4) FORGED AUTHOR: `author_peer_id` is #[serde(skip)] — it is
+            //    NEVER on the wire, so an attacker cannot even CLAIM another
+            //    identity. The receiver always binds authorship to the
+            //    cryptographically authenticated gossip source.
+            let mut forged = valid.clone();
+            forged.author_peer_id = victim_pid.to_string();
+            let forged_bytes = serde_json::to_vec(&forged).unwrap();
+            let forged_json = String::from_utf8(forged_bytes.clone()).unwrap();
+            assert!(
+                !forged_json.contains(&victim_pid.to_string()),
+                "author id must not be wire-serializable"
+            );
+            let round_trip: SwarmInferenceMessage =
+                serde_json::from_slice(&forged_bytes).unwrap();
+            assert!(
+                round_trip.author_peer_id.is_empty(),
+                "deserialized author is always empty"
+            );
+            handle_gossip_message(
+                gossip_msg(forged_bytes), &mut swarm, &my_id, &local_kp, &mut peer_rates,
+                &mut peer_keys, &mut pending, &topics, inf_tx.clone(), tomb_tx.clone(), resp_tx.clone(),
+            );
+            let bound = inf_rx.try_recv().expect("wire message accepted");
+            assert_eq!(
+                bound.author_peer_id,
+                attacker_pid.to_string(),
+                "author must be bound to the real gossip source"
+            );
+
+            // 5) OVERSIZED PAYLOAD: dropped pre-parse at the 128 KB ceiling.
+            let oversize = vec![b'A'; 140_000];
+            handle_gossip_message(
+                gossip_msg(oversize), &mut swarm, &my_id, &local_kp, &mut peer_rates,
+                &mut peer_keys, &mut pending, &topics, inf_tx.clone(), tomb_tx.clone(), resp_tx.clone(),
+            );
+            assert!(inf_rx.try_recv().is_err(), "oversized payload must be dropped");
+
+            // 6) GARBAGE BYTES: parse fails silently, no panic, nothing stored.
+            handle_gossip_message(
+                gossip_msg(b"\x00\xff{{{{not json at all".to_vec()), &mut swarm, &my_id, &local_kp,
+                &mut peer_rates, &mut peer_keys, &mut pending, &topics,
+                inf_tx.clone(), tomb_tx.clone(), resp_tx.clone(),
+            );
+            assert!(inf_rx.try_recv().is_err(), "garbage must not reach the store");
+
+            // 7) FLOOD: 60 rapid messages — rate limiter caps at 20/s; the
+            //    pipeline stays alive and nothing leaks through.
+            for i in 0..60 {
+                handle_gossip_message(
+                    gossip_msg(format!("flood {i}").into_bytes()), &mut swarm, &my_id, &local_kp,
+                    &mut peer_rates, &mut peer_keys, &mut pending, &topics,
+                    inf_tx.clone(), tomb_tx.clone(), resp_tx.clone(),
+                );
+            }
+            assert!(inf_rx.try_recv().is_err(), "flood must not inject content");
+
+            // 7b) RATE LIMITER SEMANTICS (the exact production objects):
+            //     20 msgs/s per author inside the 1-second window, then
+            //     refuse; the node-wide aggregate cap allows 120.
+            let mut rate = PeerRate::new(Instant::now());
+            let allowed = (0..25)
+                .filter(|_| rate.allow(Instant::now(), MAX_MSGS_PER_PEER_PER_SEC))
+                .count();
+            assert_eq!(
+                allowed, MAX_MSGS_PER_PEER_PER_SEC as usize,
+                "only 20 msgs/s allowed per author"
+            );
+            let mut node_rate = PeerRate::new(Instant::now());
+            let node_allowed = (0..125)
+                .filter(|_| node_rate.allow(Instant::now(), MAX_MSGS_NODEWIDE_PER_SEC))
+                .count();
+            assert_eq!(
+                node_allowed, MAX_MSGS_NODEWIDE_PER_SEC as usize,
+                "node-wide cap must be 120 msgs/s"
+            );
+        });
+
+        let _ = std::fs::remove_file("mbhub_rehearsal.db");
+        let _ = std::fs::remove_file("mbhub_rehearsal.db-wal");
+        let _ = std::fs::remove_file("mbhub_rehearsal.db-shm");
     }
 }

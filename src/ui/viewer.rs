@@ -3,11 +3,11 @@
 
 use std::cell::RefCell;
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::model::InferenceRecord;
 use crate::theme;
@@ -110,10 +110,7 @@ impl ViewerState {
     }
 
     /// Viewer for legal agreement (Terms of Service & Legal Framework) text.
-    pub fn with_tos_metadata(
-        content: impl Into<String>,
-        version: impl Into<String>,
-    ) -> Self {
+    pub fn with_tos_metadata(content: impl Into<String>, version: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             scroll_offset: 0,
@@ -318,13 +315,20 @@ fn draw_provenance_bar(
         spans.push(Span::styled(&meta.date_str, bold_style));
     } else if w >= 50 {
         // Compact bar for medium width
-        let p_short = if meta.is_swarm { "Swarm" } else { &meta.provider };
+        let p_short = if meta.is_swarm {
+            "Swarm"
+        } else {
+            &meta.provider
+        };
         spans.push(Span::styled(" P: ", base_style));
         spans.push(Span::styled(p_short, bold_style));
         spans.push(Span::styled(" │ M: ", base_style));
         let m_max = w.saturating_sub(35).max(8);
         let m_disp: String = if meta.model.chars().count() > m_max {
-            format!("{}…", &meta.model.chars().take(m_max - 1).collect::<String>())
+            format!(
+                "{}…",
+                &meta.model.chars().take(m_max - 1).collect::<String>()
+            )
         } else {
             meta.model.clone()
         };
@@ -335,7 +339,10 @@ fn draw_provenance_bar(
         // Ultra-compact for narrow width (< 50)
         let m_max = w.saturating_sub(15).max(6);
         let m_disp: String = if meta.model.chars().count() > m_max {
-            format!("{}…", &meta.model.chars().take(m_max - 1).collect::<String>())
+            format!(
+                "{}…",
+                &meta.model.chars().take(m_max - 1).collect::<String>()
+            )
         } else {
             meta.model.clone()
         };

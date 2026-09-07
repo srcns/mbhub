@@ -7,8 +7,8 @@ use std::io::{BufRead, BufReader, Read};
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
-use serde_json::{json, Value};
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use serde_json::{Value, json};
 
 use crate::api::prompt::MBHUB_SYSTEM_PROMPT;
 use crate::model::PROVIDERS;
@@ -16,7 +16,10 @@ use crate::model::PROVIDERS;
 #[derive(Clone, Debug)]
 pub enum StreamMessage {
     Token(String),
-    Done { full_text: String, is_truncated: bool },
+    Done {
+        full_text: String,
+        is_truncated: bool,
+    },
     Error(String),
 }
 
@@ -353,7 +356,9 @@ fn run_stream(
 
     if let Some(err) = read_error {
         is_truncated = true;
-        answer.push_str(&format!("\n\n[⚠️ RESPONSE INCOMPLETE: Connection lost ({err})]"));
+        answer.push_str(&format!(
+            "\n\n[⚠️ RESPONSE INCOMPLETE: Connection lost ({err})]"
+        ));
     } else if output_capped {
         // Audit O13: the truncation detector in p2p/protocol.rs refuses
         // content containing this marker, so capped output is rendered to the
@@ -384,8 +389,18 @@ mod tests {
         let mut total = 0usize;
         let mut truncated = false;
 
-        assert!(enforce_output_cap(&mut text, "Hello ", &mut total, &mut truncated));
-        assert!(enforce_output_cap(&mut text, "world", &mut total, &mut truncated));
+        assert!(enforce_output_cap(
+            &mut text,
+            "Hello ",
+            &mut total,
+            &mut truncated
+        ));
+        assert!(enforce_output_cap(
+            &mut text,
+            "world",
+            &mut total,
+            &mut truncated
+        ));
         assert_eq!(text, "Hello world");
         assert_eq!(total, 11);
         assert!(!truncated);
@@ -401,7 +416,12 @@ mod tests {
         // A chunk larger than the remaining budget: only the fitting prefix
         // is kept and the caller is told to stop consuming.
         let big = chunk(64);
-        assert!(!enforce_output_cap(&mut text, &big, &mut total, &mut truncated));
+        assert!(!enforce_output_cap(
+            &mut text,
+            &big,
+            &mut total,
+            &mut truncated
+        ));
         assert_eq!(text.len(), MAX_STREAM_OUTPUT_BYTES);
         assert_eq!(total, MAX_STREAM_OUTPUT_BYTES);
         assert!(truncated);
@@ -445,7 +465,12 @@ mod tests {
 
         // 'ä' is 2 bytes: a naive 3-byte cut would land inside a character.
         let multibyte = "äää".to_string();
-        assert!(!enforce_output_cap(&mut text, &multibyte, &mut total, &mut truncated));
+        assert!(!enforce_output_cap(
+            &mut text,
+            &multibyte,
+            &mut total,
+            &mut truncated
+        ));
         assert!(text.is_char_boundary(text.len()));
         assert_eq!(text, "ä");
         assert!(truncated);
@@ -457,7 +482,12 @@ mod tests {
         let mut total = MAX_STREAM_OUTPUT_BYTES;
         let mut truncated = true; // already flagged
 
-        assert!(!enforce_output_cap(&mut text, "more", &mut total, &mut truncated));
+        assert!(!enforce_output_cap(
+            &mut text,
+            "more",
+            &mut total,
+            &mut truncated
+        ));
         assert!(text.is_empty());
         assert_eq!(total, MAX_STREAM_OUTPUT_BYTES);
     }
@@ -477,7 +507,12 @@ mod tests {
         ));
         assert!(!truncated);
         // The next byte trips it.
-        assert!(!enforce_output_cap(&mut text, "x", &mut total, &mut truncated));
+        assert!(!enforce_output_cap(
+            &mut text,
+            "x",
+            &mut total,
+            &mut truncated
+        ));
         assert!(truncated);
     }
 }

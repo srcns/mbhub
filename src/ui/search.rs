@@ -2,11 +2,11 @@
 //! bottom input that soft-wraps and grows upward as lines are added, plus a
 //! terse char counter.
 
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::app::{App, MAX_QUERY_CHARS};
 use crate::input::QueryInput;
@@ -32,8 +32,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
 
     let count = app.query_char_count();
     let (label, style) = counter(count);
-    let counter = Paragraph::new(Line::from(Span::styled(label, style)))
-        .alignment(Alignment::Right);
+    let counter =
+        Paragraph::new(Line::from(Span::styled(label, style))).alignment(Alignment::Right);
     frame.render_widget(counter, rows[2]);
 }
 
