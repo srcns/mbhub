@@ -3,7 +3,7 @@
 **Version:** 1.0.1  
 **Status:** Active Single Source of Truth  
 **Date:** September 2026  
-**Security Model:** Zero-Trust, Serverless, Cryptographically Verifiable, BYOK (Bring Your Own Key)
+**Security Model:** Zero-Trust, Serverless, Cryptographically Verifiable (end-to-end signed wire protocol), BYOK (Bring Your Own Key)
 
 ---
 
@@ -29,7 +29,8 @@ Just as BitTorrent transitioned file distribution from centralized servers to a 
 3. **Atomic Inquiry Discipline ($\le$ 80 characters):** MBHub is an atomic knowledge engine, not a conversational chatbot. Questions are strictly bounded to 80 UTF-8 characters, eliminating prompt bloat, crystallizing technical knowledge, and guaranteeing high-confidence semantic SimHash matching.
 4. **Zero-Waste Computing:** Solved computational work is never re-executed.
 5. **Local Model Air-Gap:** Inferences generated via local models (Ollama, vLLM, LM Studio, Jan, LocalAI, llama.cpp) are strictly air-gapped (`can_gossip_to_swarm() == false`) and never announced to the mesh.
-6. **Strict Wire Constraints:** 64 KB packet ceiling, 1 MB/s upload/download throttling, max 32 concurrent mesh connections (2 concurrent connections per peer).
+6. **Strict Wire Constraints:** 128 KB packet ceiling, 1 MB/s upload/download throttling, max 32 concurrent mesh connections (2 concurrent connections per peer).
+7. **End-to-End Wire Attribution (v1.0.1):** every gossip message — inference records, queries, and responses — carries a mandatory Ed25519 signature by its gossip author; responses additionally carry a 16-bit proof-of-work. Unsigned or mis-signed messages are dropped at the swarm edge before any storage or display.
 
 ---
 
@@ -83,14 +84,14 @@ When a user submits a query via the TUI, headless CLI, or MCP interface, MBHub e
 1. **Normalization & SimHash Generation:** The query is normalized under Unicode NFKC, lowercased, and stripped of punctuation. A 64-bit SimHash fingerprint is computed. SimHash measures semantic similarity as a percentage (0.0%–100.0%) via Hamming distance.
 2. **Pre-Flight DLP Gate:** The input is scanned against sensitive credential patterns (API keys, private keys, JWT tokens, credit card numbers). Any match triggers an immediate hard block modal.
 3. **Layer 1 (L1) — Local SQLite Scan (0–5 ms):** Scans the local database against the user's configured **Hit Rate Threshold** (70%–99%, default 85%) and **Answer Freshness** policy. On hit, the cached response renders immediately.
-4. **Layer 2 (L2) — P2P Swarm Query (up to 2.5 s):** If L1 misses, an encrypted query is dispatched over libp2p GossipSub via Noise-encrypted tunnels with 50–300 ms anti-correlation jitter. The deadline covers the GossipSub mesh-settling window; failed publishes are retried within a bounded window so the first query after joining is not lost. A node with zero connected peers skips L2 instantly. Verified peer responses under 64 KB are persisted locally and displayed.
+4. **Layer 2 (L2) — P2P Swarm Query (up to 2.5 s):** If L1 misses, an encrypted query is dispatched over libp2p GossipSub via Noise-encrypted tunnels with 50–300 ms anti-correlation jitter. The deadline covers the GossipSub mesh-settling window; failed publishes are retried within a bounded window so the first query after joining is not lost. A node with zero connected peers skips L2 instantly. Verified peer responses under 128 KB are persisted locally and displayed.
 5. **Layer 3 (L3) — Live Cloud Model Inference (Streaming):** If L2 misses (or if forced via `Ctrl+Enter`), MBHub establishes a TLS 1.3 streaming connection to the configured provider. The response streams in real-time, passes post-flight redaction, is saved to SQLite, and (if from an authentic cloud provider) is gossiped to the mesh (`is_swarm = false`).
 
 ### 2.2 Layout & Wire Budget
 * **Query Ceiling:** Strictly 80 UTF-8 characters.
 * **TUI Column Budget:** Fits perfectly on standard 110-column terminal displays without horizontal clipping:  
   `DATE [16] + GAP [2] + QUESTION [80] + GAP [2] + HIT (%) [7] = 107 Columns`.
-* **Payload Ceiling:** Maximum 64 KB (65,536 bytes) per inference package. Oversized packets are dropped during pre-parse byte streaming.
+* **Payload Ceiling:** Maximum 128 KB (131,072 bytes) per gossip package. Oversized packets are dropped during pre-parse byte streaming.
 
 ### 2.3 Local Database Schema (WAL Mode)
 ```sql
@@ -126,6 +127,27 @@ CREATE INDEX IF NOT EXISTS idx_inferences_ts_sim
 
 ---
 
+### 2.4 Wire Attribution Layer (v1.0.1)
+
+Every gossip message is authenticated end-to-end by its author. The swarm
+loop signs all outgoing payloads centrally; receiving edges verify before
+any channel, database, or UI touch:
+
+| Message | Signature | Proof-of-Work | Receivers Drop When |
+| :--- | :--- | :--- | :--- |
+| Inference record | Ed25519 over (question, content, provider, model, timestamp, simhash, content_hash), length-prefixed | 24-bit over (author pubkey ‖ content_hash ‖ nonce) | signature invalid/missing, author field ≠ gossip author, PoW invalid, hash mismatch, anti-poison floor violated |
+| Query request | Ed25519 over (request_id, asker_peer_id, question, simhash, min_similarity) | — (bounded 500-record answer window keeps query cost low) | signature invalid/missing, integrity checks fail |
+| Query response | Ed25519 over (request_id, question, content, provider, model, simhash, content_hash) | 16-bit over (responder pubkey ‖ content_hash ‖ nonce) | signature invalid/missing, PoW invalid, integrity checks fail |
+| Tombstone | Ed25519 (pre-existing v1.0.0 contract) | — | signature invalid, reporter ≠ gossip author, reporter ≠ record distributor |
+
+Signatures bind content to identities: poisoned content becomes attributable
+and ban-able evidence, and unsigned legacy messages are rejected outright.
+Nodes additionally re-serve only self-produced (PoW'd) records to swarm
+queries, so unverified swarm-sourced content can never propagate through a
+peer (an amplifier for the response-PoW gate).
+
+---
+
 ## 3. Threat Model & Cybersecurity Hardening
 
 MBHub operates under a **Zero-Trust** security architecture:
@@ -136,8 +158,9 @@ MBHub operates under a **Zero-Trust** security architecture:
 | **API Provider MITM** | Intercept or tamper with API keys | TLS 1.3 root CA certificate verification + system trust store. | `api/client.rs` |
 | **Eclipse / Sybil Attack** | Isolate and surround victim node | Subnet IP diversity enforcement + random remote peer health checks. | `p2p/service.rs` |
 | **Replay Attacks** | Flood identical messages to cause DoS | BLAKE3 content-hash deduplication + timestamp validation ($\pm300$ s) + hop TTL. | `db.rs`, `p2p/protocol.rs` |
-| **Gossip Flooding / DoS** | Choke bandwidth with small packets | 20 msgs/sec per peer limit + 64 KB pre-parse ceiling + 1 MB/s bandwidth throttling. | `p2p/service.rs` |
-| **Data Tampering** | Mutate answers in transit | **BLAKE3 Content Addressing** + Ed25519 signature. Corrupt payloads dropped on arrival. | `p2p/protocol.rs` |
+| **Gossip Flooding / DoS** | Choke bandwidth with small packets | 20 msgs/sec per-author limit + 120 msgs/sec node-wide aggregate cap + 128 KB pre-parse ceiling + 1 MB/s bandwidth throttling. | `p2p/service.rs` |
+| **Data Tampering** | Mutate answers in transit | **BLAKE3 Content Addressing** + mandatory Ed25519 author signature over every field. Corrupt or unsigned payloads dropped on arrival. | `p2p/protocol.rs` |
+| **Zero-Cost Response Injection** | Answer swarm queries with poisoned content for free | Query responses require the responder's Ed25519 signature + a 16-bit PoW over the content hash; nodes re-serve only self-produced content. | `p2p/protocol.rs`, `p2p/service.rs` |
 | **Brand Impersonation** | Masquerade local model as OpenAI | Swarm records strictly tagged `PROVIDER: Unverified (swarm)` and badged `[SWARM]`. | `ui/viewer.rs` |
 | **Content Safety / Abuse** | Disseminate harmful/illegal prompts | **Two-phase deterministic + LLM safety gates** (fail-closed, 30 requests/hour budget). | `content_safety.rs` |
 | **DLP / Credential Leakage** | Leak API keys or credit cards | Structural regex + Luhn algorithm redaction (`[REDACTED_SECRET]`). | `dlp.rs`, `content_safety.rs` |
