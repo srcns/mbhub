@@ -48,7 +48,7 @@ When a query is resolved anywhere on the planet, its verified answer is crystall
 3. **Atomic Inquiry Discipline ($\le$ 80 characters):** MBHub enforces an 80-character maximum on questions. This eliminates prompt bloat, crystallizes atomic technical knowledge, and guarantees high-confidence semantic SimHash matching.
 4. **Local Model Air-Gap:** Inferences generated via local models (Ollama, vLLM, LM Studio, Jan, LocalAI, llama.cpp) are air-gapped (`can_gossip_to_swarm() == false`) and never leak to the public mesh.
 5. **Zero-Waste Computing:** Solved intelligence is never recomputed from scratch.
-6. **Strict Wire Constraints:** 64 KB packet ceiling, 1 MB/s upload/download throttling, max 32 concurrent mesh connections.
+6. **Strict Wire Constraints:** 128 KB packet ceiling with mandatory end-to-end author signatures, 1 MB/s upload/download throttling, max 32 concurrent mesh connections.
 
 ---
 
@@ -221,7 +221,7 @@ MBHub is built on a zero-trust architecture hardened against malicious actors:
 | **Terminal Hijack** | Malicious ANSI escape codes | **Strict State-Machine Sanitizer** strips OSC 52, CSI cursor control, and terminal escapes (`sanitize.rs`); CLI output is sanitized at the source. |
 | **Swarm Censorship** | Forged deletion (tombstone) broadcasts | **Ed25519-signed tombstones:** unsigned, mis-signed, or mis-attributed negative signals are dropped at the swarm edge (`p2p/service.rs`). |
 | **Brand Spoofing** | Masquerading fake outputs | Swarm-sourced records strictly labeled `PROVIDER: Unverified (swarm)` (`ui/viewer.rs`). |
-| **DoS / Flooding** | Message flooding attacks | Peer rate-limiting (20 msgs/sec), 64 KB pre-parse ceiling, 1 MB/s bandwidth cap. |
+| **DoS / Flooding** | Message flooding attacks | Peer + node-wide rate-limiting (20/s per author, 120/s aggregate), 128 KB pre-parse ceiling, 1 MB/s bandwidth cap. |
 | **Eviction Poisoning** | Forcing cache thrashing | **Locality Eviction:** In Query Locality mode, records least relevant to user profile are pruned first. |
 
 ---
