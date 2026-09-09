@@ -3,7 +3,7 @@ name = "mbhub"
 version = "1.0.1"
 edition = "2024"
 description = "The Torrent of Thought — sovereign, serverless P2P collective AI memory network for atomic answers"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
